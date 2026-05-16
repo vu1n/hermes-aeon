@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from utils import safe_json_loads
+
 from .db import AeonDB, emb_to_libsql_literal
 
 logger = logging.getLogger(__name__)
@@ -54,15 +56,6 @@ class MemoryItem:
         }
 
 
-def _safe_json(s: Optional[str], fallback: Any) -> Any:
-    if not s:
-        return fallback
-    try:
-        return json.loads(s)
-    except Exception:
-        return fallback
-
-
 def _hydrate_row(row: tuple) -> MemoryItem:
     (id_, user_id, type_, domain, status, title, summary, content, url,
      entities, tags, summary_bullets, project_id, quality_score, source,
@@ -70,9 +63,9 @@ def _hydrate_row(row: tuple) -> MemoryItem:
     return MemoryItem(
         id=id_, user_id=user_id, type=type_, domain=domain, status=status,
         title=title, summary=summary, content=content, url=url,
-        entities=_safe_json(entities, {}),
-        tags=_safe_json(tags, []),
-        summary_bullets=_safe_json(summary_bullets, []),
+        entities=safe_json_loads(entities, default={}) or {},
+        tags=safe_json_loads(tags, default=[]) or [],
+        summary_bullets=safe_json_loads(summary_bullets, default=[]) or [],
         project_id=project_id, quality_score=quality_score, source=source,
         captured_at=captured_at, event_start=event_start, event_end=event_end,
         accessed_at=accessed_at, access_count=access_count or 0,
@@ -190,8 +183,11 @@ def search_memories(
     domain: Optional[str] = None, type: Optional[str] = None, project_id: Optional[str] = None,
     limit: int = 10,
 ) -> list[MemoryItem]:
-    """Hybrid retrieval: vector_distance_cos + FTS5 bm25 fused via reciprocal-rank fusion."""
-    fts_results = []
+    """Hybrid retrieval: vector_distance_cos + FTS5 bm25 fused via reciprocal-rank fusion.
+
+    Pure read — callers must explicitly call ``touch_memories`` to bump access counts.
+    """
+    fts_results: list[tuple[str, int]] = []
     try:
         fts_query = " OR ".join(t for t in query.split() if t)
         if fts_query:
@@ -203,7 +199,7 @@ def search_memories(
     except Exception as e:
         logger.debug("fts search failed: %s", e)
 
-    vec_results = []
+    vec_results: list[tuple[str, int]] = []
     if embedding and db.has_vector:
         try:
             rows = db.execute(
@@ -214,7 +210,6 @@ def search_memories(
         except Exception as e:
             logger.debug("vector search failed: %s", e)
 
-    # RRF fusion
     K = 60
     scores: dict[str, float] = {}
     for mid, rank in fts_results:
@@ -226,34 +221,35 @@ def search_memories(
         return []
 
     placeholders = ",".join("?" for _ in scores)
-    where_extras = ["status = 'active'", f"id IN ({placeholders})"]
+    where = ["status = 'active'", f"id IN ({placeholders})"]
     params: list = list(scores.keys())
     if domain:
-        where_extras.append("domain = ?"); params.append(domain)
+        where.append("domain = ?"); params.append(domain)
     if type:
-        where_extras.append("type = ?"); params.append(type)
+        where.append("type = ?"); params.append(type)
     if project_id:
-        where_extras.append("project_id = ?"); params.append(project_id)
+        where.append("project_id = ?"); params.append(project_id)
 
     rows = db.execute(
-        f"SELECT {_SELECT_COLS} FROM memory_items WHERE {' AND '.join(where_extras)}",
+        f"SELECT {_SELECT_COLS} FROM memory_items WHERE {' AND '.join(where)}",
         tuple(params),
     ).fetchall()
 
     items = [_hydrate_row(r) for r in rows]
     items.sort(key=lambda it: scores.get(it.id, 0.0), reverse=True)
-
-    if items:
-        ts = now_ms()
-        ids = [it.id for it in items]
-        ph = ",".join("?" for _ in ids)
-        db.execute(
-            f"UPDATE memory_items SET access_count = access_count + 1, accessed_at = ? WHERE id IN ({ph})",
-            (ts, *ids),
-        )
-        db.commit()
-
     return items[:limit]
+
+
+def touch_memories(db: AeonDB, memory_ids: list[str]) -> None:
+    """Bump access_count + accessed_at. Separate from search_memories so reads stay pure."""
+    if not memory_ids:
+        return
+    ph = ",".join("?" for _ in memory_ids)
+    db.execute(
+        f"UPDATE memory_items SET access_count = access_count + 1, accessed_at = ? WHERE id IN ({ph})",
+        (now_ms(), *memory_ids),
+    )
+    db.commit()
 
 
 def get_calendar(

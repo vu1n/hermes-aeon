@@ -2,23 +2,21 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
+from hermes_cli.config import cfg_get
+from hermes_constants import get_hermes_home
+from tools.registry import tool_error, tool_result
+from utils import atomic_yaml_write
 
 from .store.db import AeonDB
 from .store import queries as q
 from .store.embed import embed_text
-from .tone.codec import (
-    AXES, DEFAULT_TONE, PRESETS, ToneState,
-    apply_axes, apply_preset,
-)
+from .tone.codec import AXES, PRESETS, apply_axes, apply_preset
 from .tone.state import ToneStore
 from .tools.browser_providers import jina
 
@@ -33,6 +31,9 @@ DOMAINS = sorted(q.VALID_DOMAINS)
 TYPES = sorted(q.VALID_TYPES)
 TONE_PRESET_NAMES = sorted(PRESETS.keys())
 
+_DOMAIN_FIELD = {"type": "string", "enum": DOMAINS}
+_TYPE_FIELD = {"type": "string", "enum": TYPES}
+
 CAPTURE_SCHEMA = {
     "name": "aeon_capture",
     "description": (
@@ -44,8 +45,8 @@ CAPTURE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "domain": {"type": "string", "enum": DOMAINS},
-            "type": {"type": "string", "enum": TYPES},
+            "domain": _DOMAIN_FIELD,
+            "type": _TYPE_FIELD,
             "content": {"type": "string", "description": "Raw text. Required if url is absent."},
             "url": {"type": "string", "description": "If present, extracted via configured extractor."},
             "title": {"type": "string"},
@@ -66,8 +67,8 @@ SEARCH_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string"},
-            "domain": {"type": "string", "enum": DOMAINS},
-            "type": {"type": "string", "enum": TYPES},
+            "domain": _DOMAIN_FIELD,
+            "type": _TYPE_FIELD,
             "project_id": {"type": "string"},
             "limit": {"type": "integer", "default": 10},
         },
@@ -83,7 +84,7 @@ CALENDAR_SCHEMA = {
         "properties": {
             "start_ms": {"type": "integer"},
             "end_ms": {"type": "integer"},
-            "domain": {"type": "string", "enum": DOMAINS},
+            "domain": _DOMAIN_FIELD,
             "limit": {"type": "integer", "default": 50},
         },
         "required": ["start_ms", "end_ms"],
@@ -139,12 +140,11 @@ GET_TONE_SCHEMA = {
 def _load_plugin_config() -> dict:
     try:
         import yaml
-        from hermes_constants import get_hermes_home
-        cfg_path = Path(get_hermes_home()) / "config.yaml"
+        cfg_path = get_hermes_home() / "config.yaml"
         if not cfg_path.exists():
             return {}
         data = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
-        return (data.get("plugins") or {}).get("hermes-aeon") or {}
+        return cfg_get(data, "plugins", "hermes-aeon", default={}) or {}
     except Exception:
         return {}
 
@@ -155,10 +155,12 @@ class AeonMemoryProvider(MemoryProvider):
         self._db: Optional[AeonDB] = None
         self._tone: Optional[ToneStore] = None
         self._session_id: str = ""
-        self._hermes_home: Path = Path.home() / ".hermes"
+        self._hermes_home: Path = get_hermes_home()
         self._embed_provider: str = self._config.get("embed_provider", "gemini")
+        # Only jina is implemented today; firecrawl support would land alongside its provider wrapper.
         self._extractor: str = self._config.get("extractor", "jina")
         self._auto_extract: bool = bool(self._config.get("auto_extract", True))
+        self._handlers: Dict[str, Any] = {}
 
     @property
     def name(self) -> str:
@@ -171,7 +173,7 @@ class AeonMemoryProvider(MemoryProvider):
         return [
             {"key": "db_path", "description": "libSQL database path", "default": "$HERMES_HOME/aeon.db"},
             {"key": "embed_provider", "description": "Embedding backend", "default": "gemini", "choices": ["gemini", "none"]},
-            {"key": "extractor", "description": "URL content extractor", "default": "jina", "choices": ["jina", "firecrawl"]},
+            {"key": "extractor", "description": "URL content extractor", "default": "jina", "choices": ["jina"]},
             {"key": "auto_extract", "description": "Auto-extract memories on session end", "default": "true", "choices": ["true", "false"]},
             {"key": "turso_url", "description": "Turso sync URL (optional)", "secret": False, "env_var": "HERMES_AEON_TURSO_URL"},
             {"key": "turso_token", "description": "Turso auth token", "secret": True, "env_var": "HERMES_AEON_TURSO_TOKEN"},
@@ -186,12 +188,12 @@ class AeonMemoryProvider(MemoryProvider):
                 existing = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-aeon"] = values
-            cfg_path.write_text(yaml.dump(existing, default_flow_style=False), encoding="utf-8")
+            atomic_yaml_write(cfg_path, existing)
         except Exception as e:
             logger.warning("save_config failed: %s", e)
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        hermes_home = Path(kwargs.get("hermes_home") or os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+        hermes_home = Path(kwargs.get("hermes_home") or get_hermes_home())
         self._hermes_home = hermes_home
         db_path = self._config.get("db_path", str(hermes_home / "aeon.db"))
         if isinstance(db_path, str):
@@ -209,6 +211,14 @@ class AeonMemoryProvider(MemoryProvider):
         tone_path = hermes_home / "hermes-aeon" / "tone.json"
         self._tone = ToneStore(tone_path)
         self._session_id = session_id
+        self._handlers = {
+            "aeon_capture": self._handle_capture,
+            "aeon_search": self._handle_search,
+            "aeon_calendar": self._handle_calendar,
+            "aeon_update": self._handle_update,
+            "aeon_set_tone": self._handle_set_tone,
+            "aeon_get_tone": self._handle_get_tone,
+        }
 
     def system_prompt_block(self) -> str:
         if not self._db:
@@ -259,20 +269,11 @@ class AeonMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if not self._db:
             return tool_error("aeon provider not initialized")
-        try:
-            if tool_name == "aeon_capture":
-                return self._handle_capture(args)
-            if tool_name == "aeon_search":
-                return self._handle_search(args)
-            if tool_name == "aeon_calendar":
-                return self._handle_calendar(args)
-            if tool_name == "aeon_update":
-                return self._handle_update(args)
-            if tool_name == "aeon_set_tone":
-                return self._handle_set_tone(args)
-            if tool_name == "aeon_get_tone":
-                return json.dumps({"tone": self._tone.get(self._session_id).to_dict()})
+        handler = self._handlers.get(tool_name)
+        if handler is None:
             return tool_error(f"unknown tool: {tool_name}")
+        try:
+            return handler(args)
         except KeyError as e:
             return tool_error(f"missing argument: {e}")
         except Exception as e:
@@ -293,6 +294,15 @@ class AeonMemoryProvider(MemoryProvider):
 
     # -- Tool handlers ------------------------------------------------------
 
+    @staticmethod
+    def _derive_title_summary(extracted: str, url: str, title: Optional[str], summary: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        if not title:
+            first_line = next((ln for ln in extracted.splitlines() if ln.strip()), "")
+            title = first_line.lstrip("# ").strip()[:200] or url
+        if not summary:
+            summary = extracted[:400].replace("\n", " ").strip()
+        return title, summary
+
     def _handle_capture(self, args: dict) -> str:
         domain = args["domain"]
         type_ = args["type"]
@@ -300,42 +310,33 @@ class AeonMemoryProvider(MemoryProvider):
         content = args.get("content")
         title = args.get("title")
         summary = args.get("summary")
-        tags = args.get("tags") or []
-        project_id = args.get("project_id")
         source = args.get("source") or ("manual" if not url else self._extractor)
 
         if url and not content:
             extracted = jina.extract(url) if self._extractor == "jina" else None
             if extracted:
                 content = extracted
-                if not title:
-                    first_line = next((ln for ln in extracted.splitlines() if ln.strip()), "")
-                    title = first_line.lstrip("# ").strip()[:200] or url
-                if not summary:
-                    summary = extracted[:400].replace("\n", " ").strip()
+                title, summary = self._derive_title_summary(extracted, url, title, summary)
             else:
                 content = url
 
         if not content and not url:
             return tool_error("aeon_capture requires content or url")
 
-        dedup_key = None
-        if url:
-            dedup_key = "url:" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
-
+        dedup_key = "url:" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] if url else None
         emb, model = embed_text(
             (title or "") + "\n" + (summary or content or ""),
             provider=self._embed_provider,
         )
-
         mid = q.capture_memory(
             self._db,
             type=type_, domain=domain, title=title, summary=summary, content=content,
-            url=url, tags=tags, project_id=project_id, source=source,
+            url=url, tags=args.get("tags") or [], project_id=args.get("project_id"),
+            source=source,
             event_start=args.get("event_start_ms"), event_end=args.get("event_end_ms"),
             dedup_key=dedup_key, embedding=emb, embedding_model=model,
         )
-        return json.dumps({"id": mid, "status": "captured", "embedded": emb is not None})
+        return tool_result(id=mid, status="captured", embedded=emb is not None)
 
     def _handle_search(self, args: dict) -> str:
         query = args["query"]
@@ -346,14 +347,17 @@ class AeonMemoryProvider(MemoryProvider):
             project_id=args.get("project_id"),
             limit=int(args.get("limit", 10)),
         )
-        return json.dumps({"results": [h.to_dict() for h in hits], "count": len(hits)})
+        # Touch the recall counters from here so search_memories stays a pure read.
+        if hits:
+            q.touch_memories(self._db, [h.id for h in hits])
+        return tool_result(results=[h.to_dict() for h in hits], count=len(hits))
 
     def _handle_calendar(self, args: dict) -> str:
         events = q.get_calendar(
             self._db, start_ms=int(args["start_ms"]), end_ms=int(args["end_ms"]),
             domain=args.get("domain"), limit=int(args.get("limit", 50)),
         )
-        return json.dumps({"events": [e.to_dict() for e in events], "count": len(events)})
+        return tool_result(events=[e.to_dict() for e in events], count=len(events))
 
     def _handle_update(self, args: dict) -> str:
         emb, model = embed_text(args["content"], provider=self._embed_provider)
@@ -365,29 +369,35 @@ class AeonMemoryProvider(MemoryProvider):
             source=args.get("source"),
             embedding=emb, embedding_model=model,
         )
-        return json.dumps({"memory_id": args["memory_id"], "revision": rev})
+        return tool_result(memory_id=args["memory_id"], revision=rev)
 
     def _handle_set_tone(self, args: dict) -> str:
         sid = self._session_id
         current = self._tone.get(sid)
         weight = float(args.get("weight", 0.7))
-        if "preset" in args and args["preset"]:
+        if args.get("preset"):
             new_state = apply_preset(current, args["preset"], weight)
-        elif "axes" in args and args["axes"]:
+        elif args.get("axes"):
             new_state = apply_axes(current, args["axes"], weight)
         else:
             return tool_error("aeon_set_tone requires preset or axes")
         self._tone.set(sid, new_state)
-        return json.dumps({"tone": new_state.to_dict()})
+        return tool_result(tone=new_state.to_dict())
+
+    def _handle_get_tone(self, args: dict) -> str:
+        return tool_result(tone=self._tone.get(self._session_id).to_dict())
 
     # -- Auto-extract -------------------------------------------------------
 
     _URL_RE = re.compile(r'https?://[^\s<>"\']+')
     _DECISION_RE = re.compile(r'\b(?:we|i)\s+(?:decided|chose|went with|picked|will use)\s+(.+)', re.IGNORECASE)
     _TASK_RE = re.compile(r'\b(?:i need to|need to|todo:|todo |i should|i must)\s+(.+)', re.IGNORECASE)
+    _AUTO_EXTRACT_URL_CAP = 10  # bound session-end network work
 
     def _auto_extract_from_transcript(self, messages: list) -> None:
         captured = 0
+        urls_seen: set[str] = set()
+
         for msg in messages:
             if msg.get("role") != "user":
                 continue
@@ -395,7 +405,12 @@ class AeonMemoryProvider(MemoryProvider):
             if not isinstance(content, str) or len(content) < 10:
                 continue
 
-            for url in self._URL_RE.findall(content)[:3]:
+            for url in self._URL_RE.findall(content):
+                if url in urls_seen:
+                    continue
+                urls_seen.add(url)
+                if len(urls_seen) > self._AUTO_EXTRACT_URL_CAP:
+                    break
                 try:
                     self._handle_capture({"domain": "inbox", "type": "link", "url": url,
                                           "source": "session-extract"})
@@ -406,9 +421,10 @@ class AeonMemoryProvider(MemoryProvider):
             m = self._DECISION_RE.search(content)
             if m:
                 try:
-                    q.capture_memory(self._db, type="note", domain="work",
-                                     content=content[:600], title=m.group(1)[:120].strip(),
-                                     source="session-extract")
+                    self._handle_capture({"domain": "work", "type": "note",
+                                          "content": content[:600],
+                                          "title": m.group(1)[:120].strip(),
+                                          "source": "session-extract"})
                     captured += 1
                 except Exception:
                     pass
@@ -416,21 +432,13 @@ class AeonMemoryProvider(MemoryProvider):
             m = self._TASK_RE.search(content)
             if m:
                 try:
-                    q.capture_memory(self._db, type="task", domain="inbox",
-                                     content=content[:600], title=m.group(1)[:120].strip(),
-                                     source="session-extract")
+                    self._handle_capture({"domain": "inbox", "type": "task",
+                                          "content": content[:600],
+                                          "title": m.group(1)[:120].strip(),
+                                          "source": "session-extract"})
                     captured += 1
                 except Exception:
                     pass
 
         if captured:
             logger.info("aeon auto-extract: captured %d items", captured)
-
-
-# ---------------------------------------------------------------------------
-# Plugin entry point
-# ---------------------------------------------------------------------------
-
-def register(ctx) -> None:
-    """Register the aeon memory provider with the plugin system."""
-    ctx.register_memory_provider(AeonMemoryProvider())

@@ -13,9 +13,10 @@ prefix).
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Optional
+
+from hermes_constants import get_hermes_home
 
 from .codec import derive_from_message, tone_to_block
 from .state import ToneStore
@@ -24,8 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def _tone_path() -> Path:
-    home = os.getenv("HERMES_HOME") or str(Path.home() / ".hermes")
-    return Path(home) / "hermes-aeon" / "tone.json"
+    return get_hermes_home() / "hermes-aeon" / "tone.json"
 
 
 def on_pre_llm_call(

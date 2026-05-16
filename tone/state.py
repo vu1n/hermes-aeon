@@ -1,4 +1,11 @@
-"""Per-session tone state persistence."""
+"""Per-session tone state persistence.
+
+Backed by a JSON file under ``HERMES_HOME/hermes-aeon/tone.json``. The
+provider and the ``pre_llm_call`` hook live in different ``sys.modules``
+instances (hermes loads the plugin twice under different namespaces), so
+disk is the only shared surface. ``get()`` reloads on every call so
+writes from either side are immediately visible.
+"""
 from __future__ import annotations
 
 import json
@@ -12,15 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 class ToneStore:
-    """Session-keyed tone state, persisted as JSON under HERMES_HOME/hermes-aeon/tone.json."""
-
     def __init__(self, path: Path):
         self._path = path
         self._cache: Dict[str, ToneState] = {}
-        self._load()
 
     def _load(self) -> None:
         if not self._path.exists():
+            self._cache = {}
             return
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
@@ -40,11 +45,10 @@ class ToneStore:
             logger.warning("tone state save failed: %s", e)
 
     def get(self, session_id: str) -> ToneState:
-        # Always reload — hook and provider live in different package instances,
-        # share state via this file, so an in-memory cache would go stale.
         self._load()
         return self._cache.get(session_id, DEFAULT_TONE)
 
     def set(self, session_id: str, state: ToneState) -> None:
+        self._load()  # merge with any concurrent writes from the other module instance
         self._cache[session_id] = state.clamp()
         self._save()
