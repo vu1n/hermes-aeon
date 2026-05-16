@@ -1,11 +1,19 @@
 """hermes-aeon — aeon memory provider for Hermes-Agent.
 
-The bundled memory-provider discovery loader is shaped for flat plugins
-(single ``__init__.py`` + sibling ``.py`` files) and pre-loads sibling
-modules WITHOUT first registering parent namespace packages. For our
-sub-package layout, that pre-load fails silently and leaves broken stubs
-in ``sys.modules``. We patch around it here: register parent namespaces,
-evict any broken stubs, then pre-install sub-packages cleanly.
+A single plugin loaded by two discovery paths:
+
+* Memory-provider discovery (``plugins/memory/__init__.py``) — flat-plugin
+  loader that pre-loads sibling ``.py`` files but does not register parent
+  namespace packages. We patch around it on import: register parent
+  namespaces, evict broken stubs, then pre-install our sub-packages so
+  ``from .store.db import ...`` etc. resolve.
+* General plugin manager (``hermes_cli/plugins.py``) — also scans
+  ``~/.hermes/plugins/`` and calls ``register(ctx)`` with a real
+  ``PluginContext`` that exposes ``register_hook``. We register the tone
+  ``pre_llm_call`` hook there.
+
+``register(ctx)`` checks which context shape it has and calls only the
+methods that exist, so the same entry point works for both paths.
 """
 import importlib.util
 import sys
@@ -27,7 +35,7 @@ def _ensure_parent_namespaces() -> None:
 
 
 def _evict_broken_children() -> None:
-    """Remove any partially-loaded children left by an earlier failed pre-load."""
+    """Remove any partially-loaded children from an earlier failed pre-load."""
     prefix = _PKG + "."
     for key in list(sys.modules.keys()):
         if key.startswith(prefix):
@@ -62,5 +70,17 @@ for _sub in ("store", "tone", "tools", "tools.browser_providers"):
 
 
 def register(ctx) -> None:
-    from .provider import AeonMemoryProvider
-    ctx.register_memory_provider(AeonMemoryProvider())
+    """Register with whichever discovery path called us.
+
+    Memory discovery passes a ``_ProviderCollector`` (has
+    ``register_memory_provider``); the general plugin manager passes a
+    ``PluginContext`` (has ``register_hook``). Branching by ``hasattr``
+    lets one entry point serve both.
+    """
+    if hasattr(ctx, "register_memory_provider"):
+        from .provider import AeonMemoryProvider
+        ctx.register_memory_provider(AeonMemoryProvider())
+
+    if hasattr(ctx, "register_hook"):
+        from .tone.hook import on_pre_llm_call
+        ctx.register_hook("pre_llm_call", on_pre_llm_call)

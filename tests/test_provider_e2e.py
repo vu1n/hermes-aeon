@@ -71,12 +71,7 @@ def test_set_tone_axes_partial_blend(provider):
     assert abs(out["tone"]["warmth"] - 0.8) < 1e-6
 
 
-def test_prefetch_includes_tone_block(provider):
-    block = provider.prefetch("hello")
-    assert "Tone state" in block
-
-
-def test_prefetch_returns_recall_when_match_exists(provider):
+def test_prefetch_returns_recall_only(provider):
     provider.handle_tool_call("aeon_capture", {
         "domain": "work", "type": "note",
         "title": "deploy notes",
@@ -84,6 +79,35 @@ def test_prefetch_returns_recall_when_match_exists(provider):
     })
     block = provider.prefetch("deploy script location")
     assert "Aeon memory recall" in block
+    assert "Tone state" not in block  # tone is injected via the pre_llm_call hook, not here
+
+
+def test_pre_llm_call_hook_returns_tone_block(provider):
+    """The hook reads ToneStore from disk and returns a {context: ...} dict."""
+    from hermes_aeon.tone.hook import on_pre_llm_call
+    out = on_pre_llm_call(session_id="test-session", user_message="hello")
+    assert out is not None
+    assert "context" in out
+    assert "Tone state" in out["context"]
+
+
+def test_pre_llm_call_hook_shares_state_with_provider(provider):
+    """Provider and hook share state via the same ToneStore JSON file on disk."""
+    from hermes_aeon.tone.hook import on_pre_llm_call
+    # Provider writes tone via its tool
+    json.loads(provider.handle_tool_call("aeon_set_tone", {"preset": "analyst", "weight": 1.0}))
+    # Hook (file-backed) reads the same value
+    out = on_pre_llm_call(session_id="test-session", user_message="hi")
+    assert "directness: 0.80" in out["context"]
+
+
+def test_pre_llm_call_hook_derives_tone_from_message(provider):
+    from hermes_aeon.tone.hook import on_pre_llm_call
+    out = on_pre_llm_call(session_id="test-session", user_message="coach me through this")
+    # The hook persisted the derived state; the provider sees it via its store too
+    new_tone = json.loads(provider.handle_tool_call("aeon_get_tone", {}))["tone"]
+    assert new_tone["warmth"] > 0.6
+    assert "Tone state" in out["context"]
 
 
 def test_calendar_filter_by_window(provider):

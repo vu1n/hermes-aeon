@@ -2,8 +2,14 @@ name: hermes-aeon
 version: 0.1.0
 description: "Aeon memory provider for Hermes — libSQL-backed personal KB with 7 domains × 10 types, hybrid vector+FTS search, append-only revisions, and a 5-axis tone codec."
 author: vu1n
+# Explicit kind=standalone bypasses the auto-coerce-to-exclusive heuristic
+# (triggered by `MemoryProvider` text in __init__.py) so the general plugin
+# manager ALSO loads us. Memory discovery loads us in parallel via its own
+# scan; register(ctx) routes by ctx capabilities (see __init__.py).
+kind: standalone
 hooks:
   - on_session_end
+  - pre_llm_call
 pip_dependencies:
   - libsql-experimental
   - httpx

@@ -40,6 +40,9 @@ class ToneStore:
             logger.warning("tone state save failed: %s", e)
 
     def get(self, session_id: str) -> ToneState:
+        # Always reload — hook and provider live in different package instances,
+        # share state via this file, so an in-memory cache would go stale.
+        self._load()
         return self._cache.get(session_id, DEFAULT_TONE)
 
     def set(self, session_id: str, state: ToneState) -> None:

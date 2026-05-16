@@ -17,7 +17,7 @@ from .store import queries as q
 from .store.embed import embed_text
 from .tone.codec import (
     AXES, DEFAULT_TONE, PRESETS, ToneState,
-    apply_axes, apply_preset, derive_from_message, tone_to_block,
+    apply_axes, apply_preset,
 )
 from .tone.state import ToneStore
 from .tools.browser_providers import jina
@@ -230,34 +230,21 @@ class AeonMemoryProvider(MemoryProvider):
         return "\n".join(lines)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._db or not self._tone:
+        if not self._db or not query or len(query) < 4:
             return ""
-
-        sid = session_id or self._session_id
-        current = self._tone.get(sid)
-        derived = derive_from_message(query, current)
-        if derived is not None:
-            self._tone.set(sid, derived)
-            current = derived
-
-        tone_block = tone_to_block(current)
-
-        recall_lines: list[str] = []
-        if query and len(query) >= 4:
-            try:
-                emb, _ = embed_text(query, provider=self._embed_provider)
-                hits = q.search_memories(self._db, query=query, embedding=emb, limit=5)
-                if hits:
-                    recall_lines.append("Aeon memory recall:")
-                    for h in hits:
-                        snippet = (h.summary or h.content or "")[:200].replace("\n", " ")
-                        recall_lines.append(f"- [{h.domain}/{h.type}] {h.title or '(untitled)'}: {snippet}")
-            except Exception as e:
-                logger.debug("aeon prefetch search failed: %s", e)
-
-        if recall_lines:
-            return tone_block + "\n\n" + "\n".join(recall_lines)
-        return tone_block
+        try:
+            emb, _ = embed_text(query, provider=self._embed_provider)
+            hits = q.search_memories(self._db, query=query, embedding=emb, limit=5)
+            if not hits:
+                return ""
+            lines = ["Aeon memory recall:"]
+            for h in hits:
+                snippet = (h.summary or h.content or "")[:200].replace("\n", " ")
+                lines.append(f"- [{h.domain}/{h.type}] {h.title or '(untitled)'}: {snippet}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.debug("aeon prefetch search failed: %s", e)
+            return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         # Heavy capture deferred to on_session_end; sync_turn stays cheap.
