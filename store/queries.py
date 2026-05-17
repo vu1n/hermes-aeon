@@ -98,10 +98,15 @@ def capture_memory(
     event_end: Optional[int] = None,
     dedup_key: Optional[str] = None,
     quality_score: Optional[float] = None,
+    captured_at: Optional[int] = None,
     embedding: Optional[list[float]] = None,
     embedding_model: Optional[str] = None,
 ) -> str:
-    """Insert a memory_item + first revision + optional embedding. Returns the new id."""
+    """Insert a memory_item + first revision + optional embedding. Returns the new id.
+
+    captured_at defaults to now; pass an explicit ms timestamp when importing
+    historical data (e.g. GitHub events, Oura daily summaries from prior days).
+    """
     if domain not in VALID_DOMAINS:
         raise ValueError(f"unknown domain: {domain}")
     if type not in VALID_TYPES:
@@ -115,7 +120,7 @@ def capture_memory(
             return existing[0]
 
     mid = uuid.uuid4().hex
-    ts = now_ms()
+    ts = captured_at if captured_at is not None else now_ms()
     db.execute(
         """INSERT INTO memory_items
            (id, user_id, type, domain, status, title, summary, content, url,

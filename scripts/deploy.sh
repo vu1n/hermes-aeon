@@ -11,7 +11,7 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$SCRIPTS_DIR"
 
 copied=0
-for f in bookmarks_fetch derive_profile discover_rss discover_x digest; do
+for f in bookmarks_fetch derive_profile discover_rss discover_x digest github_fetch; do
   src="$SOURCE_DIR/${f}.py"
   dst="$SCRIPTS_DIR/aeon_${f}.py"
   if [ -f "$src" ] && ( [ ! -f "$dst" ] || ! cmp -s "$src" "$dst" ); then
