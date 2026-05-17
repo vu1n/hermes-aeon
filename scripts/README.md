@@ -66,3 +66,35 @@ cd /opt/hermes-aeon
 /usr/local/lib/hermes-agent/venv/bin/python scripts/discover_x.py
 /usr/local/lib/hermes-agent/venv/bin/python scripts/digest.py
 ```
+
+## Deploy / redeploy after `git pull`
+
+Hermes cron rejects symlinked scripts that resolve outside `~/.hermes/scripts/`
+(path-traversal check), so scripts are copied — not symlinked. After every
+`git pull`, re-run the deploy helper to sync changed files:
+
+```sh
+cd /opt/hermes-aeon && git pull && bash scripts/deploy.sh
+```
+
+`deploy.sh` is idempotent (only copies files whose content changed) and prints
+the count of files updated.
+
+## Scheduled cron jobs
+
+| Job | Schedule | Notes |
+|---|---|---|
+| `aeon-bookmarks` | every 1h | incremental via `since_id` |
+| `aeon-derive-profile` | `0 8 * * *` | daily 8am UTC |
+| `aeon-discover-rss` | every 1h | HN + Lobste.rs |
+| `aeon-discover-x` | every 4h | needs twitterapi.io credit |
+| `aeon-digest` | `0 9 * * *` | daily 9am UTC, `--deliver telegram` |
+
+Inspect / modify:
+
+```sh
+hermes cron list
+hermes cron run <job-id>        # run-now on next tick
+hermes cron pause <job-id>
+hermes cron remove <job-id>
+```
