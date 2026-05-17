@@ -8,8 +8,8 @@ from typing import Optional
 
 import httpx
 
-from store import queries as q
-from store.embed import embed_text
+from ..store import queries as q
+from ..store.embed import embed_text
 
 log = logging.getLogger("aeon.ingest.oura")
 

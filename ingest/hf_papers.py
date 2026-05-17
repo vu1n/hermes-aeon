@@ -7,8 +7,8 @@ from datetime import datetime
 
 import httpx
 
-from store import queries as q
-from store.embed import embed_text
+from ..store import queries as q
+from ..store.embed import embed_text
 
 from ._common import llm_json, get_profile_text
 
