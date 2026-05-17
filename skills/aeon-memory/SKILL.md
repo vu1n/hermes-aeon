@@ -37,11 +37,28 @@ Pick the most specific. When in doubt, `inbox` and triage later.
 | `contact` | Person details. Domain typically `people_comms` or `work`. |
 | `other` | Last resort — flag for the user to retype or reclassify. |
 
-## When to capture vs search
+## When to capture vs search vs recent
 
 - **Capture** when the user says "save", "remember", "log", "note", "add", "I just …", or shares a URL. Pick a domain and type immediately — never ask.
-- **Search** before answering any factual question that depends on the user's history. Run `aeon_search` first; the tool is cheap.
+- **Search** (`aeon_search`) before answering any factual question that depends on the user's history. Hybrid vector + FTS5 query — answers "what did I save about X" style questions.
+- **Recent** (`aeon_recent`) for time-windowed "show me" queries — "what's new today", "top picks this week", "what HN came in". Paginated; pass `hours`, `min_score`, `source` to filter.
 - **Both** when the user asks about something they've mentioned before — search first to ground, then capture any new information they share.
+
+## When to use aeon_recent vs aeon_search
+
+Reach for `aeon_recent` (NOT `aeon_search`) when the user asks for:
+- "Show me today's discoveries" → `aeon_recent(hours=24)`
+- "What's new this week" → `aeon_recent(hours=168)`
+- "Top picks from HN today" → `aeon_recent(hours=24, source="discover:hn")`
+- "Strong matches only" → add `min_score=0.7`
+- "More" / "next page" → `aeon_recent(offset=<next_offset from previous response>)`
+
+Sources for the `source` filter:
+- `discover:` — all scored discoveries
+- `discover:hn`, `discover:lobsters`, `discover:x`, `discover:hf-papers` — specific firehose
+- `x-bookmark` — user's own bookmarks
+- `github:` — work activity (commits, PRs, reviews)
+- `oura:` — health data
 
 ## URL handling
 
