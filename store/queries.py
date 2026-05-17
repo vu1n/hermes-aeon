@@ -97,6 +97,7 @@ def capture_memory(
     event_start: Optional[int] = None,
     event_end: Optional[int] = None,
     dedup_key: Optional[str] = None,
+    quality_score: Optional[float] = None,
     embedding: Optional[list[float]] = None,
     embedding_model: Optional[str] = None,
 ) -> str:
@@ -118,12 +119,12 @@ def capture_memory(
     db.execute(
         """INSERT INTO memory_items
            (id, user_id, type, domain, status, title, summary, content, url,
-            entities, tags, summary_bullets, project_id, source,
+            entities, tags, summary_bullets, project_id, quality_score, source,
             captured_at, event_start, event_end, dedup_key, current_revision)
-           VALUES (?, 'local', ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+           VALUES (?, 'local', ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
         (mid, type, domain, title, summary, content, url,
          json.dumps(entities or {}), json.dumps(tags or []), json.dumps([]),
-         project_id, source, ts, event_start, event_end, dedup_key),
+         project_id, quality_score, source, ts, event_start, event_end, dedup_key),
     )
     db.execute(
         "INSERT INTO memory_revisions (memory_id, revision_n, content, summary, source, created_at) VALUES (?, 1, ?, ?, ?, ?)",
