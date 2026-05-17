@@ -23,7 +23,7 @@ log = setup_logging("discover_rss")
 
 DEFAULT_FEEDS = [
     {"name": "hn-frontpage",     "url": "https://hnrss.org/frontpage",     "source": "hn"},
-    {"name": "lobste-hottest",   "url": "https://lobste.rs/hottest.rss",   "source": "lobsters"},
+    {"name": "lobsters-hottest", "url": "https://lobste.rs/rss",           "source": "lobsters"},
 ]
 SCORE_THRESHOLD = float(os.environ.get("DISCOVER_SCORE_THRESHOLD", "0.6"))
 MAX_PER_FEED = int(os.environ.get("DISCOVER_MAX_PER_FEED", "30"))
