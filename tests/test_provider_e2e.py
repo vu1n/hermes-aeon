@@ -27,11 +27,11 @@ def test_provider_name_and_available(provider):
     assert provider.is_available() is True
 
 
-def test_get_tool_schemas_returns_six(provider):
+def test_get_tool_schemas_returns_seven(provider):
     schemas = provider.get_tool_schemas()
     names = {s["name"] for s in schemas}
     assert names == {
-        "aeon_capture", "aeon_search", "aeon_calendar",
+        "aeon_capture", "aeon_search", "aeon_calendar", "aeon_recent",
         "aeon_update", "aeon_set_tone", "aeon_get_tone",
     }
 
@@ -108,6 +108,77 @@ def test_pre_llm_call_hook_derives_tone_from_message(provider):
     new_tone = json.loads(provider.handle_tool_call("aeon_get_tone", {}))["tone"]
     assert new_tone["warmth"] > 0.6
     assert "Tone state" in out["context"]
+
+
+def test_recent_orders_by_score_with_unscored_last(provider):
+    # Three captures: 2 scored, 1 unscored
+    a = json.loads(provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "link", "title": "A", "content": "a"}))["id"]
+    b = json.loads(provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "link", "title": "B", "content": "b"}))["id"]
+    c = json.loads(provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "link", "title": "C", "content": "c"}))["id"]
+    # Hand-set quality_scores on A and C via direct DB update (capture tool doesn't set it)
+    provider._db.execute("UPDATE memory_items SET quality_score = 0.9 WHERE id = ?", (a,))
+    provider._db.execute("UPDATE memory_items SET quality_score = 0.6 WHERE id = ?", (c,))
+    provider._db.commit()
+
+    out = json.loads(provider.handle_tool_call("aeon_recent", {"hours": 1, "limit": 10}))
+    titles = [it["title"] for it in out["items"]]
+    # A (0.9) before C (0.6); B (unscored) last
+    assert titles.index("A") < titles.index("C") < titles.index("B")
+
+
+def test_recent_filters_by_min_score(provider):
+    provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "link", "title": "low", "content": "x"})
+    provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "link", "title": "high", "content": "y"})
+    high_id = provider._db.execute("SELECT id FROM memory_items WHERE title='high'").fetchone()[0]
+    provider._db.execute("UPDATE memory_items SET quality_score = 0.8 WHERE id = ?", (high_id,))
+    provider._db.commit()
+
+    out = json.loads(provider.handle_tool_call("aeon_recent", {"min_score": 0.7}))
+    titles = [it["title"] for it in out["items"]]
+    assert titles == ["high"]
+
+
+def test_recent_paginates(provider):
+    for i in range(5):
+        provider.handle_tool_call("aeon_capture", {
+            "domain": "learning", "type": "link", "title": f"item{i}", "content": "x"})
+
+    p1 = json.loads(provider.handle_tool_call("aeon_recent", {"limit": 2, "offset": 0}))
+    p2 = json.loads(provider.handle_tool_call("aeon_recent", {"limit": 2, "offset": p1["next_offset"]}))
+    assert p1["total"] >= 5
+    assert len(p1["items"]) == 2
+    assert len(p2["items"]) == 2
+    p1_ids = {it["id"] for it in p1["items"]}
+    p2_ids = {it["id"] for it in p2["items"]}
+    assert not (p1_ids & p2_ids), "pages must not overlap"
+    assert p1["has_more"] is True
+
+
+def test_recent_filters_by_source_prefix(provider):
+    # Use direct DB inserts to control source values
+    provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "link", "title": "A", "content": "x"})
+    provider._db.execute(
+        "UPDATE memory_items SET source = 'discover:hn' WHERE title = 'A'")
+    provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "link", "title": "B", "content": "y"})
+    provider._db.execute(
+        "UPDATE memory_items SET source = 'discover:x' WHERE title = 'B'")
+    provider._db.commit()
+
+    out_all = json.loads(provider.handle_tool_call("aeon_recent", {"source": "discover:"}))
+    titles_all = {it["title"] for it in out_all["items"]}
+    assert {"A", "B"}.issubset(titles_all)
+
+    out_hn = json.loads(provider.handle_tool_call("aeon_recent", {"source": "discover:hn"}))
+    titles_hn = {it["title"] for it in out_hn["items"]}
+    assert "A" in titles_hn
+    assert "B" not in titles_hn
 
 
 def test_calendar_filter_by_window(provider):

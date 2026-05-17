@@ -132,6 +132,36 @@ GET_TONE_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+RECENT_SCHEMA = {
+    "name": "aeon_recent",
+    "description": (
+        "Time-windowed list of recent items from the personal KB, sorted by "
+        "quality_score (highest first) by default. Use for 'show me today / "
+        "this week's discoveries / top picks / what came in from HN' style "
+        "queries. Paginated via offset+limit; returns total + has_more so the "
+        "agent can offer to page further."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "hours": {"type": "integer", "default": 24,
+                      "description": "Time window in hours. Common: 24 (today), 72 (3d), 168 (week), 720 (30d)."},
+            "limit": {"type": "integer", "default": 20,
+                      "description": "Max items per page (capped at 100)."},
+            "offset": {"type": "integer", "default": 0,
+                       "description": "Pagination offset. Pass next_offset from previous response to page."},
+            "min_score": {"type": "number",
+                          "description": "Filter to scored items with quality_score >= this (e.g. 0.7 = strong matches only). Omit to include unscored items (bookmarks, github events, oura)."},
+            "source": {"type": "string",
+                       "description": "Source prefix filter. Examples: 'discover:' (all discoveries), 'discover:hn', 'discover:x', 'discover:hf-papers', 'github:', 'oura:', 'x-bookmark'."},
+            "domain": _DOMAIN_FIELD,
+            "type": _TYPE_FIELD,
+            "order": {"type": "string", "enum": ["score", "captured_at"], "default": "score",
+                      "description": "score: highest quality first (unscored items go last). captured_at: most recent first."},
+        },
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Provider
@@ -215,6 +245,7 @@ class AeonMemoryProvider(MemoryProvider):
             "aeon_capture": self._handle_capture,
             "aeon_search": self._handle_search,
             "aeon_calendar": self._handle_calendar,
+            "aeon_recent": self._handle_recent,
             "aeon_update": self._handle_update,
             "aeon_set_tone": self._handle_set_tone,
             "aeon_get_tone": self._handle_get_tone,
@@ -262,7 +293,7 @@ class AeonMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
-            CAPTURE_SCHEMA, SEARCH_SCHEMA, CALENDAR_SCHEMA, UPDATE_SCHEMA,
+            CAPTURE_SCHEMA, SEARCH_SCHEMA, CALENDAR_SCHEMA, RECENT_SCHEMA, UPDATE_SCHEMA,
             SET_TONE_SCHEMA, GET_TONE_SCHEMA,
         ]
 
@@ -358,6 +389,67 @@ class AeonMemoryProvider(MemoryProvider):
             domain=args.get("domain"), limit=int(args.get("limit", 50)),
         )
         return tool_result(events=[e.to_dict() for e in events], count=len(events))
+
+    def _handle_recent(self, args: dict) -> str:
+        hours = max(1, int(args.get("hours", 24)))
+        limit = max(1, min(int(args.get("limit", 20)), 100))
+        offset = max(0, int(args.get("offset", 0)))
+        order = args.get("order", "score")
+        cutoff_ms = q.now_ms() - hours * 3600 * 1000
+
+        where = ["status = 'active'", "captured_at >= ?"]
+        params: list = [cutoff_ms]
+
+        if args.get("min_score") is not None:
+            where.append("quality_score IS NOT NULL AND quality_score >= ?")
+            params.append(float(args["min_score"]))
+        if args.get("source"):
+            where.append("source LIKE ?")
+            params.append(args["source"] + ("" if args["source"].endswith("%") else "%"))
+        if args.get("domain"):
+            where.append("domain = ?")
+            params.append(args["domain"])
+        if args.get("type"):
+            where.append("type = ?")
+            params.append(args["type"])
+
+        if order == "captured_at":
+            order_by = "captured_at DESC"
+        else:
+            # Scored items first (by score), then unscored (by recency)
+            order_by = ("CASE WHEN quality_score IS NULL THEN 1 ELSE 0 END, "
+                        "quality_score DESC, captured_at DESC")
+
+        where_sql = " AND ".join(where)
+        total = self._db.execute(
+            f"SELECT COUNT(*) FROM memory_items WHERE {where_sql}", tuple(params)
+        ).fetchone()[0]
+
+        rows = self._db.execute(
+            f"SELECT id, title, url, summary, content, quality_score, source, "
+            f"domain, type, captured_at FROM memory_items WHERE {where_sql} "
+            f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+            tuple(params + [limit, offset]),
+        ).fetchall()
+
+        now = q.now_ms()
+        items = []
+        for r in rows:
+            id_, title, url, summary, content, score, source, domain, type_, ts = r
+            age_h = (now - ts) / 3600000
+            snippet = summary or (content or "")[:200].replace("\n", " ").strip() or None
+            items.append({
+                "id": id_, "title": title, "url": url, "snippet": snippet,
+                "quality_score": score,
+                "source": source, "domain": domain, "type": type_,
+                "age_hours": round(age_h, 1),
+            })
+
+        next_offset = offset + len(items) if (offset + len(items)) < total else None
+        return tool_result(
+            items=items, count=len(items), total=total,
+            window_hours=hours, has_more=next_offset is not None, next_offset=next_offset,
+        )
 
     def _handle_update(self, args: dict) -> str:
         emb, model = embed_text(args["content"], provider=self._embed_provider)
