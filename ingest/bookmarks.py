@@ -22,15 +22,6 @@ def _xurl_get(path: str, app: str) -> dict:
     return json.loads(proc.stdout)
 
 
-def _latest_id(db) -> str | None:
-    row = db.execute(
-        "SELECT url FROM memory_items "
-        "WHERE source = 'x-bookmark' AND url LIKE 'https://x.com/i/web/status/%' "
-        "ORDER BY captured_at DESC LIMIT 1"
-    ).fetchone()
-    return row[0].rsplit("/", 1)[-1] if row else None
-
-
 def _capture(db, tweet: dict) -> bool:
     tid = tweet["id"]
     text = tweet.get("text", "")
@@ -59,11 +50,10 @@ def run(db, *, backfill: bool = False, max_results: int = 100) -> dict:
     user_id = os.environ.get("X_USER_ID", "15781023")
     app = os.environ.get("XURL_APP", "hermes-aeon")
 
+    # X's bookmarks endpoint does NOT support since_id. We always fetch
+    # the latest page (most recent first) and rely on dedup_key to skip
+    # already-captured tweets. For backfill, paginate via next_token.
     path = f"/2/users/{user_id}/bookmarks?max_results={max_results}"
-    if not backfill:
-        since = _latest_id(db)
-        if since:
-            path += f"&since_id={since}"
 
     captured = seen = pages = 0
     next_token: str | None = None
