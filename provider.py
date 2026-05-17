@@ -132,6 +132,75 @@ GET_TONE_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+# ---------------------------------------------------------------------------
+# Pull / refresh tool schemas — agent can trigger fetchers in chat;
+# cron prompts call these via prompt-mode rather than --script files.
+# ---------------------------------------------------------------------------
+
+PULL_BOOKMARKS_SCHEMA = {
+    "name": "aeon_pull_bookmarks",
+    "description": "Pull new X bookmarks via xurl. Captures each as memory_item (source=x-bookmark). Pass backfill=true for paginated all-history pull (first run only).",
+    "parameters": {"type": "object", "properties": {
+        "backfill": {"type": "boolean", "default": False},
+    }},
+}
+
+PULL_GITHUB_SCHEMA = {
+    "name": "aeon_pull_github",
+    "description": "Pull recent GitHub events (commits, PRs, reviews, comments, releases, stars). Captured at original event time.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+PULL_OURA_SCHEMA = {
+    "name": "aeon_pull_oura",
+    "description": "Pull Oura daily summaries (sleep, activity, readiness, workouts). Incremental 3-day window by default; backfill=true uses OURA_BACKFILL_DAYS (30).",
+    "parameters": {"type": "object", "properties": {
+        "backfill": {"type": "boolean", "default": False},
+        "days": {"type": "integer", "description": "Override the window (overrides backfill/incremental defaults)."},
+    }},
+}
+
+PULL_RSS_SCHEMA = {
+    "name": "aeon_pull_rss",
+    "description": "Pull HN frontpage + Lobste.rs RSS, LLM-score each new item vs interest profile, capture above threshold (default 0.6) with quality_score.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+PULL_X_SCHEMA = {
+    "name": "aeon_pull_x",
+    "description": "Search X via twitterapi.io using topics derived from interest profile, score each vs profile, capture above threshold (default 0.7).",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+PULL_HF_PAPERS_SCHEMA = {
+    "name": "aeon_pull_hf_papers",
+    "description": "Pull Hugging Face daily papers, score vs profile, capture above threshold (default 0.55).",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+PULL_HYPE_SCHEMA = {
+    "name": "aeon_pull_hype",
+    "description": "Pull hype.replicate.dev cross-platform AI/ML engagement firehose (GitHub/HF/Reddit/Replicate), score, capture above threshold (default 0.6).",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+DERIVE_PROFILE_SCHEMA = {
+    "name": "aeon_derive_profile",
+    "description": "Re-derive the user's interest profile from recent X bookmarks (recency-weighted), upsert to profile memory (revisions track evolution). Returns {updated, bookmarks, profile_chars}.",
+    "parameters": {"type": "object", "properties": {
+        "lookback_days": {"type": "integer", "default": 90},
+        "min_bookmarks": {"type": "integer", "default": 5},
+    }},
+}
+
+DIGEST_SCHEMA = {
+    "name": "aeon_digest",
+    "description": "Synthesize a daily readout across discoveries, GitHub work, Oura health, and recent bookmarks. Returns {text, totals, window_hours}. The text is Telegram-markdown ready.",
+    "parameters": {"type": "object", "properties": {
+        "hours": {"type": "integer", "default": 24, "description": "Time window for the digest (default 24h)."},
+    }},
+}
+
 RECENT_SCHEMA = {
     "name": "aeon_recent",
     "description": (
@@ -249,6 +318,16 @@ class AeonMemoryProvider(MemoryProvider):
             "aeon_update": self._handle_update,
             "aeon_set_tone": self._handle_set_tone,
             "aeon_get_tone": self._handle_get_tone,
+            # Ingest tools — agent-triggerable fetchers
+            "aeon_pull_bookmarks": self._handle_pull_bookmarks,
+            "aeon_pull_github": self._handle_pull_github,
+            "aeon_pull_oura": self._handle_pull_oura,
+            "aeon_pull_rss": self._handle_pull_rss,
+            "aeon_pull_x": self._handle_pull_x,
+            "aeon_pull_hf_papers": self._handle_pull_hf_papers,
+            "aeon_pull_hype": self._handle_pull_hype,
+            "aeon_derive_profile": self._handle_derive_profile,
+            "aeon_digest": self._handle_digest,
         }
 
     def system_prompt_block(self) -> str:
@@ -295,6 +374,9 @@ class AeonMemoryProvider(MemoryProvider):
         return [
             CAPTURE_SCHEMA, SEARCH_SCHEMA, CALENDAR_SCHEMA, RECENT_SCHEMA, UPDATE_SCHEMA,
             SET_TONE_SCHEMA, GET_TONE_SCHEMA,
+            PULL_BOOKMARKS_SCHEMA, PULL_GITHUB_SCHEMA, PULL_OURA_SCHEMA,
+            PULL_RSS_SCHEMA, PULL_X_SCHEMA, PULL_HF_PAPERS_SCHEMA, PULL_HYPE_SCHEMA,
+            DERIVE_PROFILE_SCHEMA, DIGEST_SCHEMA,
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -478,6 +560,56 @@ class AeonMemoryProvider(MemoryProvider):
 
     def _handle_get_tone(self, args: dict) -> str:
         return tool_result(tone=self._tone.get(self._session_id).to_dict())
+
+    # -- Ingest tool dispatchers --------------------------------------------
+    # Each is a thin wrapper around the corresponding ingest.<module>.run().
+    # Same code path for cron triggers and chat invocations.
+
+    def _handle_pull_bookmarks(self, args: dict) -> str:
+        from .ingest import bookmarks
+        result = bookmarks.run(self._db, backfill=bool(args.get("backfill", False)))
+        return tool_result(**result)
+
+    def _handle_pull_github(self, args: dict) -> str:
+        from .ingest import github
+        return tool_result(**github.run(self._db))
+
+    def _handle_pull_oura(self, args: dict) -> str:
+        from .ingest import oura
+        kwargs = {"backfill": bool(args.get("backfill", False))}
+        if args.get("days") is not None:
+            kwargs["days"] = int(args["days"])
+        return tool_result(**oura.run(self._db, **kwargs))
+
+    def _handle_pull_rss(self, args: dict) -> str:
+        from .ingest import rss
+        return tool_result(**rss.run(self._db))
+
+    def _handle_pull_x(self, args: dict) -> str:
+        from .ingest import twitter
+        return tool_result(**twitter.run(self._db))
+
+    def _handle_pull_hf_papers(self, args: dict) -> str:
+        from .ingest import hf_papers
+        return tool_result(**hf_papers.run(self._db))
+
+    def _handle_pull_hype(self, args: dict) -> str:
+        from .ingest import hype
+        return tool_result(**hype.run(self._db))
+
+    def _handle_derive_profile(self, args: dict) -> str:
+        from .ingest import profile
+        kwargs = {}
+        if args.get("lookback_days") is not None:
+            kwargs["lookback_days"] = int(args["lookback_days"])
+        if args.get("min_bookmarks") is not None:
+            kwargs["min_bookmarks"] = int(args["min_bookmarks"])
+        return tool_result(**profile.run(self._db, **kwargs))
+
+    def _handle_digest(self, args: dict) -> str:
+        from .ingest import digest
+        hours = int(args.get("hours", 24))
+        return tool_result(**digest.run(self._db, hours=hours))
 
     # -- Auto-extract -------------------------------------------------------
 

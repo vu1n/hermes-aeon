@@ -27,13 +27,20 @@ def test_provider_name_and_available(provider):
     assert provider.is_available() is True
 
 
-def test_get_tool_schemas_returns_seven(provider):
+def test_get_tool_schemas_returns_all(provider):
     schemas = provider.get_tool_schemas()
     names = {s["name"] for s in schemas}
-    assert names == {
-        "aeon_capture", "aeon_search", "aeon_calendar", "aeon_recent",
-        "aeon_update", "aeon_set_tone", "aeon_get_tone",
+    expected = {
+        # Memory CRUD + query
+        "aeon_capture", "aeon_search", "aeon_calendar", "aeon_recent", "aeon_update",
+        # Tone
+        "aeon_set_tone", "aeon_get_tone",
+        # Ingest (agent-triggerable fetchers)
+        "aeon_pull_bookmarks", "aeon_pull_github", "aeon_pull_oura",
+        "aeon_pull_rss", "aeon_pull_x", "aeon_pull_hf_papers", "aeon_pull_hype",
+        "aeon_derive_profile", "aeon_digest",
     }
+    assert names == expected, f"missing: {expected - names}; extra: {names - expected}"
 
 
 def test_capture_then_search_roundtrip(provider):

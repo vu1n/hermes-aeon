@@ -1,8 +1,7 @@
-"""Shared helpers for hermes-aeon cron scripts.
+"""Shared helpers for ingest functions.
 
-Scripts run via `hermes cron --script --no-agent` so they're pure background
-workers. They share state with hermes-aeon (same libSQL db) by importing the
-plugin's query layer directly.
+These run inside the provider via tool dispatch (db passed in), and can also
+be invoked from cron via `hermes cron "Run aeon_pull_X" --skill aeon-memory`.
 """
 from __future__ import annotations
 
@@ -10,65 +9,12 @@ import json
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Any, Optional
 
-# Bootstrap import paths so scripts work both standalone and from hermes cron.
-PLUGIN_ROOT = Path("/opt/hermes-aeon")
-if str(PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_ROOT))
-
-HERMES_AGENT_ROOT = Path("/usr/local/lib/hermes-agent")
-if HERMES_AGENT_ROOT.exists() and str(HERMES_AGENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(HERMES_AGENT_ROOT))
-
-
-# Load ~/.hermes/.env once at import — cron jobs don't always inherit env.
-def _load_env() -> None:
-    env_file = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / ".env"
-    if not env_file.exists():
-        return
-    for line in env_file.read_text().splitlines():
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, _, v = s.partition("=")
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        if k and k not in os.environ:
-            os.environ[k] = v
-
-
-_load_env()
-
-
-# Logging — stderr so stdout stays clean for `hermes cron --deliver` payloads.
-def setup_logging(name: str, level: int = logging.INFO) -> logging.Logger:
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s",
-                                               datefmt="%Y-%m-%dT%H:%M:%SZ"))
-        logger.addHandler(handler)
-    logger.setLevel(level)
-    return logger
-
-
-# DB connection — single shared aeon.db file.
-def get_db():
-    from store.db import AeonDB
-    db = AeonDB(
-        db_path=os.environ.get("HERMES_AEON_DB", str(Path.home() / ".hermes" / "aeon.db")),
-        turso_url=os.environ.get("HERMES_AEON_TURSO_URL"),
-        turso_token=os.environ.get("HERMES_AEON_TURSO_TOKEN"),
-    )
-    db.connect()
-    db.bootstrap_schema()
-    return db
+logger = logging.getLogger(__name__)
 
 
 # LLM helper — defaults to Groq (fast, free tier, llama-3.3-70b-versatile).
-# Override with CRON_LLM_PROVIDER=gemini|openrouter and CRON_LLM_MODEL.
 def llm_chat(prompt: str, *, system: Optional[str] = None,
              json_mode: bool = False, max_tokens: int = 1024,
              temperature: float = 0.2) -> str:
@@ -99,10 +45,8 @@ def llm_chat(prompt: str, *, system: Optional[str] = None,
     messages.append({"role": "user", "content": prompt})
 
     payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
+        "model": model, "messages": messages,
+        "max_tokens": max_tokens, "temperature": temperature,
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -110,8 +54,7 @@ def llm_chat(prompt: str, *, system: Optional[str] = None,
     resp = httpx.post(
         url,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=60.0,
+        json=payload, timeout=60.0,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
@@ -125,9 +68,8 @@ def _gemini_chat(prompt: str, *, system: Optional[str], json_mode: bool,
         raise RuntimeError("GEMINI_API_KEY not set")
     model = os.environ.get("CRON_LLM_MODEL", "gemini-2.5-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    parts = [{"text": prompt}]
     payload: dict[str, Any] = {
-        "contents": [{"role": "user", "parts": parts}],
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
     }
     if system:
@@ -140,7 +82,6 @@ def _gemini_chat(prompt: str, *, system: Optional[str], json_mode: bool,
 
 
 def llm_json(prompt: str, **kwargs) -> Any:
-    """Same as llm_chat but parses JSON response. Strips markdown fences if present."""
     text = llm_chat(prompt, json_mode=True, **kwargs)
     text = text.strip()
     if text.startswith("```"):
@@ -151,7 +92,7 @@ def llm_json(prompt: str, **kwargs) -> Any:
     return json.loads(text)
 
 
-# Profile-memory helpers — interest profile lives as a single memory_item.
+# Profile-memory helpers
 PROFILE_DEDUP_KEY = "profile:interests"
 
 
@@ -164,7 +105,6 @@ def get_profile_text(db) -> Optional[str]:
 
 
 def upsert_profile(db, content: str, summary: Optional[str] = None) -> str:
-    """Insert or append-revision the interest profile memory."""
     from store import queries as q
     from store.embed import embed_text
     existing = db.execute(

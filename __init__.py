@@ -65,7 +65,7 @@ def _install_subpackage(rel: str) -> None:
 
 _ensure_parent_namespaces()
 _evict_broken_children()
-for _sub in ("store", "tone", "tools", "tools.browser_providers"):
+for _sub in ("store", "tone", "tools", "tools.browser_providers", "ingest"):
     _install_subpackage(_sub)
 
 

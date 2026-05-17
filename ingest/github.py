@@ -1,54 +1,36 @@
-"""Every 30m: pull recent GitHub activity events into the KB.
-
-Captures each interesting event (push, PR open/close, review, comment, release,
-create) as a memory_item with the original event timestamp. Used for:
-- Correlation intelligence ("high commit days + poor sleep next day")
-- "What did I ship this week" reflective queries
-- Project activity per repo (project_id = repo full_name)
-
-Domain heuristic: repos owned by GITHUB_USER -> 'side_projects', anything
-else (orgs, contributions to upstream) -> 'work'.
-"""
+"""Pull recent GitHub events. Returns dict {captured, skipped, fetched}."""
 from __future__ import annotations
 
+import logging
 import os
-import sys
 from datetime import datetime
 from typing import Any, Optional
 
 import httpx
 
-from _common import setup_logging, get_db
 from store import queries as q
 from store.embed import embed_text
 
-log = setup_logging("github_fetch")
+log = logging.getLogger("aeon.ingest.github")
 
-GH_USER = os.environ.get("GITHUB_USER", "vu1n")
-GH_TOKEN = os.environ.get("GITHUB_API_KEY")
-PER_PAGE = int(os.environ.get("GITHUB_PER_PAGE", "100"))
-MAX_PAGES = int(os.environ.get("GITHUB_MAX_PAGES", "3"))
 GH_API = "https://api.github.com"
 
 
-def _gh_headers() -> dict:
-    if not GH_TOKEN:
-        raise RuntimeError("GITHUB_API_KEY not set")
+def _headers(token: str) -> dict:
     return {
-        "Authorization": f"Bearer {GH_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
 
-def fetch_events() -> list[dict]:
-    """Paginate /users/<user>/events for recent activity. Includes public + private."""
+def _fetch(user: str, token: str, per_page: int, max_pages: int) -> list[dict]:
     events: list[dict] = []
-    for page in range(1, MAX_PAGES + 1):
+    for page in range(1, max_pages + 1):
         resp = httpx.get(
-            f"{GH_API}/users/{GH_USER}/events",
-            headers=_gh_headers(),
-            params={"per_page": PER_PAGE, "page": page},
+            f"{GH_API}/users/{user}/events",
+            headers=_headers(token),
+            params={"per_page": per_page, "page": page},
             timeout=20.0,
         )
         if resp.status_code == 404:
@@ -58,27 +40,23 @@ def fetch_events() -> list[dict]:
         if not batch:
             break
         events.extend(batch)
-        # If we got less than a full page, no more pages
-        if len(batch) < PER_PAGE:
+        if len(batch) < per_page:
             break
     return events
 
 
 def _parse_ts(iso: str) -> int:
-    """Convert GitHub's ISO8601 UTC timestamp to ms."""
     return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
 
 
-def event_to_memory(event: dict) -> Optional[dict[str, Any]]:
-    """Convert a GitHub event to memory_item kwargs. Returns None to skip the event."""
+def _to_memory(event: dict, gh_user: str) -> Optional[dict[str, Any]]:
     etype = event.get("type") or ""
     repo_name = (event.get("repo") or {}).get("name") or ""
     payload = event.get("payload") or {}
-
     if not repo_name:
         return None
     owner = repo_name.split("/", 1)[0]
-    domain = "side_projects" if owner == GH_USER else "work"
+    domain = "side_projects" if owner == gh_user else "work"
 
     if etype == "PushEvent":
         commits = payload.get("commits") or []
@@ -130,82 +108,60 @@ def event_to_memory(event: dict) -> Optional[dict[str, Any]]:
         ref_type = payload.get("ref_type") or ""
         ref = payload.get("ref") or ""
         if ref_type == "branch":
-            # Skip branch creates — too noisy
             return None
         title = f"Created {ref_type}{' ' + ref if ref else ''}: {repo_name}"
         content = (payload.get("description") or "")[:500]
         url = f"https://github.com/{repo_name}"
     elif etype == "WatchEvent":
-        # Starred a repo — actually a "Watch" in API terms
         title = f"Starred {repo_name}"
         content = ""
         url = f"https://github.com/{repo_name}"
-        domain = "learning"  # stars reflect interest, not work
+        domain = "learning"
     elif etype == "ForkEvent":
         forkee = payload.get("forkee") or {}
         title = f"Forked {repo_name} -> {forkee.get('full_name') or '?'}"
         content = (forkee.get("description") or "")[:500]
         url = forkee.get("html_url") or f"https://github.com/{repo_name}"
     else:
-        return None  # uninteresting (DeleteEvent, PublicEvent, MemberEvent, etc.)
+        return None
 
-    return {
-        "title": title,
-        "content": content,
-        "url": url,
-        "domain": domain,
-        "project_id": repo_name,
-        "ts_ms": _parse_ts(event.get("created_at", "")),
-        "etype": etype,
-    }
+    return {"title": title, "content": content, "url": url, "domain": domain,
+            "project_id": repo_name, "ts_ms": _parse_ts(event.get("created_at", "")),
+            "etype": etype}
 
 
-def main() -> int:
-    if not GH_TOKEN:
-        log.error("GITHUB_API_KEY not set")
-        return 2
+def run(db) -> dict:
+    gh_user = os.environ.get("GITHUB_USER", "vu1n")
+    token = os.environ.get("GITHUB_API_KEY")
+    if not token:
+        raise RuntimeError("GITHUB_API_KEY not set")
 
-    db = get_db()
-    try:
-        events = fetch_events()
-        log.info("fetched %d raw events", len(events))
+    per_page = int(os.environ.get("GITHUB_PER_PAGE", "100"))
+    max_pages = int(os.environ.get("GITHUB_MAX_PAGES", "3"))
+    events = _fetch(gh_user, token, per_page, max_pages)
 
-        captured = 0
-        skipped = 0
-        for event in events:
-            mem = event_to_memory(event)
-            if mem is None:
-                skipped += 1
-                continue
+    captured = skipped = 0
+    for event in events:
+        mem = _to_memory(event, gh_user)
+        if mem is None:
+            skipped += 1
+            continue
+        dedup = f"github:{event['id']}"
+        if db.execute("SELECT 1 FROM memory_items WHERE dedup_key = ? LIMIT 1",
+                      (dedup,)).fetchone():
+            continue
+        emb, model = embed_text(mem["title"] + "\n" + mem["content"],
+                                provider=os.environ.get("HERMES_AEON_EMBED", "gemini"))
+        q.capture_memory(
+            db, type="note", domain=mem["domain"],
+            title=mem["title"], content=mem["content"], url=mem["url"],
+            tags=["github", mem["etype"]],
+            project_id=mem["project_id"],
+            source=f"github:{mem['etype']}",
+            dedup_key=dedup, captured_at=mem["ts_ms"],
+            embedding=emb, embedding_model=model,
+        )
+        captured += 1
 
-            dedup = f"github:{event['id']}"
-            if db.execute("SELECT 1 FROM memory_items WHERE dedup_key = ? LIMIT 1",
-                          (dedup,)).fetchone():
-                continue
-
-            emb, model = embed_text(
-                mem["title"] + "\n" + mem["content"],
-                provider=os.environ.get("HERMES_AEON_EMBED", "gemini"),
-            )
-            q.capture_memory(
-                db, type="note", domain=mem["domain"],
-                title=mem["title"], content=mem["content"], url=mem["url"],
-                tags=["github", mem["etype"]],
-                project_id=mem["project_id"],
-                source=f"github:{mem['etype']}",
-                dedup_key=dedup,
-                captured_at=mem["ts_ms"],
-                embedding=emb, embedding_model=model,
-            )
-            captured += 1
-
-        log.info("captured=%d skipped=%d", captured, skipped)
-        if captured:
-            print(f"github: captured {captured} events ({skipped} skipped)")
-        return 0
-    finally:
-        db.close()
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    log.info("fetched=%d captured=%d skipped=%d", len(events), captured, skipped)
+    return {"fetched": len(events), "captured": captured, "skipped": skipped}

@@ -55,10 +55,33 @@ Reach for `aeon_recent` (NOT `aeon_search`) when the user asks for:
 
 Sources for the `source` filter:
 - `discover:` — all scored discoveries
-- `discover:hn`, `discover:lobsters`, `discover:x`, `discover:hf-papers` — specific firehose
+- `discover:hn`, `discover:lobsters`, `discover:x`, `discover:hf-papers`, `discover:hype-*` — specific firehose
 - `x-bookmark` — user's own bookmarks
 - `github:` — work activity (commits, PRs, reviews)
 - `oura:` — health data
+
+## Pull / refresh tools (agent-triggerable fetchers)
+
+Reach for these when the user asks to refresh a source explicitly, or when you've just answered a question and the underlying data is stale:
+
+- `aeon_pull_bookmarks(backfill=False)` — pull new X bookmarks via xurl
+- `aeon_pull_github()` — pull recent GitHub events (commits, PRs, reviews)
+- `aeon_pull_oura(backfill=False, days?)` — pull Oura daily sleep/activity/readiness/workouts
+- `aeon_pull_rss()` — pull HN + Lobste.rs, score vs profile, capture matches
+- `aeon_pull_x()` — twitterapi.io topic search using profile-derived keywords
+- `aeon_pull_hf_papers()` — Hugging Face daily papers, scored
+- `aeon_pull_hype()` — hype.replicate.dev (GitHub/HF/Reddit/Replicate firehose)
+- `aeon_derive_profile(lookback_days=90)` — re-derive interest profile from recent bookmarks
+- `aeon_digest(hours=24)` — synthesize a narrative readout across all sources
+
+All `aeon_pull_*` tools return `{captured, ...}` so you can summarize: "pulled 12 bookmarks, captured 12 new". `aeon_digest` returns `{text, totals, window_hours}` — the `text` is Telegram-markdown-ready.
+
+Examples:
+- *"refresh my bookmarks"* → `aeon_pull_bookmarks()`
+- *"backfill the last 90 days of Oura"* → `aeon_pull_oura(backfill=True, days=90)`
+- *"re-derive my profile"* → `aeon_derive_profile()`
+- *"give me a digest of the last 3 days"* → `aeon_digest(hours=72)` then send the `.text` field
+- *"pull HN now and tell me the top picks"* → `aeon_pull_rss()` then `aeon_recent(hours=1, source="discover:hn")`
 
 ## URL handling
 
