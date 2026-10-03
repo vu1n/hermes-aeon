@@ -12,12 +12,13 @@ SOURCES = {"x-bookmark", "discover:hf-papers", "discover:hn", "discover:hype-git
            "github:PullRequestReviewEvent", "github:WatchEvent"}
 HOSTS = {"github.com", "arxiv.org", "huggingface.co", "news.ycombinator.com",
          "lobste.rs", "x.com", "twitter.com", "reddit.com", "www.reddit.com"}
+# Start email matching once per local-part run, avoiding quadratic suffix retries.
 UNSAFE = re.compile(
     r"(?i)\b(?:health|medical|patient|diagnos\w*|therapy|sleep|nutrition|oura|"
     r"multivitamin|medication|prescription|salary|bank|mortgage|credit\s*card|"
     r"investment|financial|password|credential|secret|bearer|private[ _-]?key)\b|"
     r"api[ _-]?key|\bsk-[A-Za-z0-9_-]+|\btoken\s*[:=]|"
-    r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|"
+    r"(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
     r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions|"
     r"(?:reveal|exfiltrate)\s+(?:the\s+)?(?:secret|token|credential)"

@@ -26,6 +26,9 @@ def provider(tmp_path, monkeypatch):
     sql=(Path(__file__).resolve().parent.parent / "aeon_sharedwrites/migration.sql").read_text()
     for statement in sql.split(';'):
         if statement.strip():p._db.execute(statement)
+    sql=(Path(__file__).resolve().parent.parent / "brain_service/migration.sql").read_text()
+    for statement in sql.split(';'):
+        if statement.strip():p._db.execute(statement)
     p._db.commit()
     yield p
     p.shutdown()
@@ -45,11 +48,26 @@ def test_get_tool_schemas_returns_all(provider):
         # Tone
         "aeon_set_tone", "aeon_get_tone",
         # Ingest (agent-triggerable fetchers)
-        "aeon_pull_bookmarks", "aeon_pull_github", "aeon_pull_oura",
+        "aeon_pull_bookmarks", "aeon_pull_github",
         "aeon_pull_rss", "aeon_pull_x", "aeon_pull_hf_papers", "aeon_pull_hype",
-        "aeon_derive_profile", "aeon_digest",
+        "aeon_digest",
     }
     assert names == expected, f"missing: {expected - names}; extra: {names - expected}"
+
+
+def test_system_prompt_keeps_active_context_after_newer_imports(provider):
+    from hermes_aeon.brain_service.policy import HERMES
+    from hermes_aeon.brain_service.service import Service, now_ms
+    from hermes_aeon.store import queries
+    brain=Service(provider._db)
+    mid=brain.capture(HERMES,dict(request_id='active-context',statement='Synthetic active compiler project',
+                                 domain='work',record_class='working_context'))['memory_id']
+    provider._db.execute('UPDATE memory_items SET captured_at=? WHERE id=?',(now_ms()-1000,mid))
+    provider._db.commit()
+    for number in range(101):
+        queries.capture_memory(provider._db,type='note',domain='learning',content='Synthetic newer feed item',
+                               source='discover:hn',request_id='feed'+str(number))
+    assert 'Synthetic active compiler project' in provider.system_prompt_block()
 
 
 def test_capture_then_search_roundtrip(provider):
@@ -209,7 +227,7 @@ def test_calendar_filter_by_window(provider):
     out = json.loads(provider.handle_tool_call("aeon_calendar", {
         "start_ms": 0, "end_ms": 2_000_000_000_000,
     }))
-    assert out["count"] == 1
+    assert "unavailable" in str(out).lower()
 
 
 def test_update_appends_revision(provider):
@@ -229,9 +247,52 @@ def test_on_session_end_extracts_url(provider):
     found = json.loads(provider.handle_tool_call("aeon_search", {
         "query": "example", "domain": "inbox", "type": "link",
     }))
-    assert found["count"] >= 1
+    assert "error" in str(found).lower()
+    # Stored legacy inbox evidence is not admitted to the initial GENERAL corpus.
+    assert provider._db.execute("SELECT count(*) FROM memory_items WHERE domain='inbox'").fetchone()[0]>=1
 
 
 def test_system_prompt_block_is_string(provider):
     block = provider.system_prompt_block()
     assert isinstance(block, str)
+
+
+def test_general_routes_exclude_synthetic_health_metadata_and_unknown_context(provider,monkeypatch):
+    from hermes_aeon.store import queries as q
+    canary='SYNTHETIC_RESTRICTED_CANARY'
+    q.capture_memory(provider._db,type='note',domain='health',content=canary,source='oura:synthetic')
+    q.capture_memory(provider._db,type='note',domain='work',content='Harmless project',entities={'detail':'medical '+canary},source='manual')
+    provider._db.execute('INSERT INTO tom_cards VALUES(?,?,?,?,?,?)',('tom','local','work',canary,9999999999999,1))
+    provider._db.execute('INSERT INTO capsules VALUES(?,?,?,?,?,?,?,?)',('capsule','local','work','daily',1,2,canary,1))
+    provider._db.commit()
+    assert canary not in provider.system_prompt_block()
+    assert canary not in provider.prefetch('project restricted canary')
+    for name,args in [('aeon_search',{'query':'canary project'}),('aeon_recent',{}),('aeon_derive_profile',{}),('aeon_pull_oura',{}),('aeon_calendar',{'start_ms':0,'end_ms':9999999999999})]:
+        assert canary not in provider.handle_tool_call(name,args)
+    captured=[]
+    from hermes_aeon.ingest import digest as digest_module
+    monkeypatch.setattr(digest_module,'llm_chat',lambda prompt,**kwargs:captured.append(prompt) or 'Synthetic general digest')
+    digest=provider.handle_tool_call('aeon_digest',{})
+    assert canary not in digest
+    assert all(canary not in prompt for prompt in captured)
+
+
+def test_digest_revalidates_general_input_revisions(provider,monkeypatch):
+    from hermes_aeon.store import queries as q
+    from hermes_aeon.ingest import digest
+    mid=q.capture_memory(provider._db,type='note',domain='work',content='General project input',source='manual')
+    def synthesize(prompt,**kwargs):
+        q.update_memory_content(provider._db,memory_id=mid,expected_revision=1,content='medical restricted update',summary=None,source='manual')
+        return 'Derived stale result'
+    monkeypatch.setattr(digest,'llm_chat',synthesize)
+    result=digest.run(provider._db)
+    assert result['text']==''
+    assert result['error']=='general_inputs_changed'
+
+
+def test_missing_general_gate_has_no_canonical_recall_fallback(provider):
+    provider._db.execute('DROP TABLE brain_records');provider._db.commit()
+    assert provider.prefetch('Synthetic project')==''
+    assert provider.system_prompt_block()==''
+    out=provider.handle_tool_call('aeon_search',{'query':'project'})
+    assert 'error' in out.lower()

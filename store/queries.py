@@ -9,8 +9,12 @@ from typing import Optional
 
 from .utils import safe_json_loads
 from . import shared_writer
+if '.' in __package__:
+    from ..brain_service import hermes as general
+else:
+    from brain_service import hermes as general
 
-from .db import AeonDB, emb_to_libsql_literal
+from .db import AeonDB
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +94,13 @@ def capture_memory(db,*,type,domain,title=None,summary=None,content=None,url=Non
         type=type,domain=domain,title=title,summary=summary,content=content,url=url,tags=tags,
         entities=entities,project_id=project_id,source=source,event_start=event_start,event_end=event_end,
         dedup_key=dedup_key,quality_score=quality_score,captured_at=captured_at,embedding=embedding,
-        embedding_model=embedding_model)['memory_id']
+        embedding_model=embedding_model,revision_hook=general.revision_hook(db))['memory_id']
 
 def update_memory_content(db,*,memory_id,expected_revision,content,summary,source,
     embedding=None,embedding_model=None,request_id=None):
     return shared_writer.update(db,consumer_id='hermes',request_id=request_id or uuid.uuid4().hex,
         memory_id=memory_id,expected_revision=expected_revision,content=content,summary=summary,
-        source=source,embedding=embedding,embedding_model=embedding_model)['revision']
+        source=source,embedding=embedding,embedding_model=embedding_model,revision_hook=general.revision_hook(db))['revision']
 
 
 def search_memories(
@@ -104,61 +108,10 @@ def search_memories(
     domain: Optional[str] = None, type: Optional[str] = None, project_id: Optional[str] = None,
     limit: int = 10,
 ) -> list[MemoryItem]:
-    """Hybrid retrieval: vector_distance_cos + FTS5 bm25 fused via reciprocal-rank fusion.
-
-    Pure read — callers must explicitly call ``touch_memories`` to bump access counts.
-    """
-    fts_results: list[tuple[str, int]] = []
-    try:
-        fts_query = " OR ".join(t for t in query.split() if t)
-        if fts_query:
-            rows = db.execute(
-                "SELECT memory_id, bm25(memory_fts) AS rank FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank LIMIT 50",
-                (fts_query,),
-            ).fetchall()
-            fts_results = [(r[0], i) for i, r in enumerate(rows)]
-    except Exception as e:
-        logger.debug("fts search failed: %s", e)
-
-    vec_results: list[tuple[str, int]] = []
-    if embedding and db.has_vector:
-        try:
-            rows = db.execute(
-                "SELECT memory_id, vector_distance_cos(embedding, vector32(?)) AS dist FROM memory_embeddings ORDER BY dist LIMIT 50",
-                (emb_to_libsql_literal(embedding),),
-            ).fetchall()
-            vec_results = [(r[0], i) for i, r in enumerate(rows)]
-        except Exception as e:
-            logger.debug("vector search failed: %s", e)
-
-    K = 60
-    scores: dict[str, float] = {}
-    for mid, rank in fts_results:
-        scores[mid] = scores.get(mid, 0.0) + 1.0 / (K + rank)
-    for mid, rank in vec_results:
-        scores[mid] = scores.get(mid, 0.0) + 1.0 / (K + rank)
-
-    if not scores:
-        return []
-
-    placeholders = ",".join("?" for _ in scores)
-    where = ["status = 'active'", f"id IN ({placeholders})"]
-    params: list = list(scores.keys())
-    if domain:
-        where.append("domain = ?"); params.append(domain)
-    if type:
-        where.append("type = ?"); params.append(type)
-    if project_id:
-        where.append("project_id = ?"); params.append(project_id)
-
-    rows = db.execute(
-        f"SELECT {_SELECT_COLS} FROM memory_items WHERE {' AND '.join(where)}",
-        tuple(params),
-    ).fetchall()
-
-    items = [_hydrate_row(r) for r in rows]
-    items.sort(key=lambda it: scores.get(it.id, 0.0), reverse=True)
-    return items[:limit]
+    """General-only lexical recall; global vector/FTS candidates are never consulted."""
+    result=general.service(db).search(general.HERMES,query=query,domain=domain,type=type,
+                                     project_id=project_id,limit=limit)
+    return [MemoryItem(**{k:v for k,v in item.items() if k in MemoryItem.__dataclass_fields__}) for item in result['items']]
 
 
 def touch_memories(db: AeonDB, memory_ids: list[str]) -> None:
