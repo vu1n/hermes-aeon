@@ -1,0 +1,26 @@
+[Unit]
+Description=Aeon canonical transactional write broker
+Requires=aeon-write.socket
+After=aeon-write.socket
+
+[Service]
+User=aeon-writer
+Group=aeon-kb-writers
+EnvironmentFile=/etc/aeon-brain/consumer.env
+ExecStart=/usr/bin/python3 /opt/aeon-sharedwrites/broker.py --db /var/lib/aeon-canonical/aeon.db --listen-fd 3 --allowed-uid ${AEON_CONSUMER_UID} --consumer-id ${AEON_CONSUMER_ID} --shared-module /opt/hermes-aeon/store/shared_writer.py
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aeon-canonical /var/lib/aeon-events
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+UMask=0007
+MemoryMax=128M
+TasksMax=12
+TimeoutStopSec=10

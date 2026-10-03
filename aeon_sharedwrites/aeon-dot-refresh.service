@@ -1,0 +1,25 @@
+[Unit]
+Description=Refresh filtered Aeon view after commits or reconciliation
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/aeon-sharedwrites/read_adapter/refresh_event.py --source /var/lib/aeon-canonical/aeon.db --output /var/lib/aeon-dot/approved-kb.sqlite --marker /var/lib/aeon-events/dirty --reader-group dot
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=45
+UMask=0077
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=/var/lib/aeon-canonical
+ReadWritePaths=/var/lib/aeon-dot /var/lib/aeon-events
+CapabilityBoundingSet=CAP_CHOWN
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes

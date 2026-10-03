@@ -98,11 +98,12 @@ UPDATE_SCHEMA = {
         "type": "object",
         "properties": {
             "memory_id": {"type": "string"},
+            "expected_revision": {"type": "integer", "minimum": 1},
             "content": {"type": "string"},
             "summary": {"type": "string"},
             "source": {"type": "string"},
         },
-        "required": ["memory_id", "content"],
+        "required": ["memory_id", "content", "expected_revision"],
     },
 }
 
@@ -534,15 +535,20 @@ class AeonMemoryProvider(MemoryProvider):
         )
 
     def _handle_update(self, args: dict) -> str:
+        from .store.shared_writer import Conflict, WriteError
+        if type(args.get("expected_revision")) is not int or args["expected_revision"] < 1:
+            return tool_error("expected_revision is required; read the memory before updating")
         emb, model = embed_text(args["content"], provider=self._embed_provider)
-        rev = q.update_memory_content(
-            self._db,
-            memory_id=args["memory_id"],
-            content=args["content"],
-            summary=args.get("summary"),
-            source=args.get("source"),
-            embedding=emb, embedding_model=model,
-        )
+        try:
+            rev = q.update_memory_content(
+                self._db, memory_id=args["memory_id"], expected_revision=args["expected_revision"],
+                content=args["content"], summary=args.get("summary"), source=args.get("source"),
+                embedding=emb, embedding_model=model,
+            )
+        except Conflict as error:
+            return tool_result(error="revision_conflict", current_revision=error.current_revision)
+        except WriteError as error:
+            return tool_error(error.code)
         return tool_result(memory_id=args["memory_id"], revision=rev)
 
     def _handle_set_tone(self, args: dict) -> str:

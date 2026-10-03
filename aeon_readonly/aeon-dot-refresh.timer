@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the read-only Aeon transport view every five minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5min
+AccuracySec=5s
+Unit=aeon-dot-refresh.service
+
+[Install]
+WantedBy=timers.target

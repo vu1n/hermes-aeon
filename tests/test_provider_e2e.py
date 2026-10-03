@@ -10,7 +10,10 @@ def provider(tmp_path, monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_AEON_TURSO_URL", raising=False)
     monkeypatch.delenv("HERMES_AEON_TURSO_TOKEN", raising=False)
+    pytest.importorskip("agent.memory_provider", reason="provider lifecycle requires the Hermes host runtime")
     from hermes_aeon.provider import AeonMemoryProvider
+    # Never perform URL extraction over the network during lifecycle tests.
+    monkeypatch.setattr("hermes_aeon.provider.jina.extract", lambda url: "# Synthetic article\n" + url)
     p = AeonMemoryProvider(config={
         "db_path": str(tmp_path / "aeon.db"),
         "embed_provider": "none",
@@ -18,6 +21,12 @@ def provider(tmp_path, monkeypatch):
         "auto_extract": True,
     })
     p.initialize(session_id="test-session", hermes_home=str(tmp_path))
+    # Migration is an explicit operator step; never automatic during a request.
+    from pathlib import Path
+    sql=(Path(__file__).resolve().parent.parent / "aeon_sharedwrites/migration.sql").read_text()
+    for statement in sql.split(';'):
+        if statement.strip():p._db.execute(statement)
+    p._db.commit()
     yield p
     p.shutdown()
 
@@ -172,6 +181,7 @@ def test_recent_filters_by_source_prefix(provider):
         "domain": "learning", "type": "link", "title": "A", "content": "x"})
     provider._db.execute(
         "UPDATE memory_items SET source = 'discover:hn' WHERE title = 'A'")
+    provider._db.commit()  # shared writes own their transaction
     provider.handle_tool_call("aeon_capture", {
         "domain": "learning", "type": "link", "title": "B", "content": "y"})
     provider._db.execute(
@@ -207,7 +217,7 @@ def test_update_appends_revision(provider):
         "domain": "learning", "type": "note", "content": "v1 thought",
     }))
     upd = json.loads(provider.handle_tool_call("aeon_update", {
-        "memory_id": cap["id"], "content": "v2 thought, refined",
+        "memory_id": cap["id"], "content": "v2 thought, refined", "expected_revision": 1,
     }))
     assert upd["revision"] == 2
 
