@@ -1,5 +1,13 @@
 # Shared-brain deployment and rollback
 
+This runbook describes the existing snapshot/broker deployment. The newer
+[general service foundation](general-brain-foundation.md) is code-only and needs
+its own separately approved deployment decisions. When installing a commit
+containing that foundation, keep `brain_service` and `aeon_readonly/projection`
+alongside the canonical Hermes plugin files; its imports share the screening
+policy. Existing general reads fail closed until its explicit schema is applied.
+Do not infer approval for that migration or new gateway exposure from this guide.
+
 This runbook is an opt-in storage/security change. Publishing or merging code
 does not approve deployment. Obtain explicit approval for the canonical handoff,
 additive migration, writer service, socket access, private event directory,

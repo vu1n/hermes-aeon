@@ -144,7 +144,7 @@ def capture(db,*,consumer_id,request_id,type,domain,title=None,summary=None,cont
             tags=None,entities=None,project_id=None,source=None,event_start=None,event_end=None,
             dedup_key=None,quality_score=None,captured_at=None,embedding=None,embedding_model=None,
             entry_kind='imported_record',attribution_basis='source_import',conversation_ref=None,
-            checkpoint=None,retries=3):
+            checkpoint=None,retries=3,extra_payload=None,revision_hook=None):
     meta=provenance(consumer_id,request_id,entry_kind,attribution_basis,conversation_ref)
     if domain not in DOMAINS or type not in TYPES:raise Invalid()
     # Size policy belongs to the untrusted broker boundary, not Hermes' canonical API.
@@ -155,6 +155,7 @@ def capture(db,*,consumer_id,request_id,type,domain,title=None,summary=None,cont
     if not isinstance(tags,list) or any(not isinstance(t,str) for t in tags) or not isinstance(entities,dict):raise Invalid()
     validate_embedding(embedding)
     payload={"type":type,"domain":domain,"title":title,"summary":summary,"content":content,"url":url,"tags":tags,"entities":entities,"project_id":project_id,"source":source,"event_start":event_start,"event_end":event_end,"dedup_key":dedup_key,"quality_score":quality_score,"captured_at":captured_at,"embedding":embedding,"embedding_model":embedding_model}
+    if extra_payload is not None:payload['metadata']=extra_payload
     def action(now,point):
         if dedup_key is not None:
             old=db.execute("SELECT id,current_revision FROM memory_items WHERE dedup_key=?",(dedup_key,)).fetchone()
@@ -166,7 +167,9 @@ def capture(db,*,consumer_id,request_id,type,domain,title=None,summary=None,cont
         db.execute("INSERT INTO memory_fts(memory_id,title,summary,content) VALUES(?,?,?,?)",(mid,title or '',summary or '',content or ''));point('after_fts')
         _embedding(db,mid,embedding,embedding_model,now);point('after_embedding')
         _audit(db,mid,1,'capture',meta,now,point)
-        return {"memory_id":mid,"revision":1,"created":True,"deduplicated":False}
+        result={"memory_id":mid,"revision":1,"created":True,"deduplicated":False}
+        if revision_hook is not None:revision_hook(result,now)
+        return result
     return _transaction(db,'capture',payload,meta,action,checkpoint,retries)
 
 # The capture signature retains Hermes' keyword `type`; avoid shadowing built-in validation.
@@ -175,13 +178,14 @@ type_of=type
 def update(db,*,consumer_id,request_id,memory_id,expected_revision,content,summary=None,
            source=None,embedding=None,embedding_model=None,entry_kind='imported_record',
            attribution_basis='source_import',conversation_ref=None,checkpoint=None,retries=3,
-           eligible_sources=None,eligible_domains=None):
+           eligible_sources=None,eligible_domains=None,extra_payload=None,revision_hook=None):
     meta=provenance(consumer_id,request_id,entry_kind,attribution_basis,conversation_ref)
     if not isinstance(memory_id,str) or not re.fullmatch(r'[a-f0-9]{32}',memory_id):raise Invalid()
     if type(expected_revision) is not int or expected_revision<1:raise Invalid()
     text(content);text(summary);text(source);text(embedding_model)
     validate_embedding(embedding)
     payload={"id":memory_id,"expected_revision":expected_revision,"content":content,"summary":summary,"source":source,"embedding":embedding,"embedding_model":embedding_model,"eligible_sources":sorted(eligible_sources) if eligible_sources is not None else None,"eligible_domains":sorted(eligible_domains) if eligible_domains is not None else None}
+    if extra_payload is not None:payload['metadata']=extra_payload
     def action(now,point):
         row=db.execute("SELECT current_revision,title,status,source,domain FROM memory_items WHERE id=?",(memory_id,)).fetchone()
         if not row or row[2]!='active' or (eligible_sources is not None and row[3] not in eligible_sources) or (eligible_domains is not None and row[4] not in eligible_domains):raise NotFound()
@@ -193,5 +197,7 @@ def update(db,*,consumer_id,request_id,memory_id,expected_revision,content,summa
         db.execute("INSERT INTO memory_fts(memory_id,title,summary,content) VALUES(?,?,?,?)",(memory_id,row[1] or '',summary or '',content or ''));point('after_fts')
         _embedding(db,memory_id,embedding,embedding_model,now,True);point('after_embedding')
         _audit(db,memory_id,rev,'update',meta,now,point)
-        return {"memory_id":memory_id,"revision":rev,"updated":True}
+        result={"memory_id":memory_id,"revision":rev,"updated":True}
+        if revision_hook is not None:revision_hook(result,now)
+        return result
     return _transaction(db,'update',payload,meta,action,checkpoint,retries)

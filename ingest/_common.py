@@ -97,11 +97,8 @@ PROFILE_DEDUP_KEY = "profile:interests"
 
 
 def get_profile_text(db) -> Optional[str]:
-    row = db.execute(
-        "SELECT content FROM memory_items WHERE dedup_key = ? LIMIT 1",
-        (PROFILE_DEDUP_KEY,),
-    ).fetchone()
-    return row[0] if row else None
+    """Old prose profiles have unknown lineage and cannot drive general discovery."""
+    return None
 
 
 def upsert_profile(db, content: str, summary: Optional[str] = None) -> str:

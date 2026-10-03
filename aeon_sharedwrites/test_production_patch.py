@@ -33,7 +33,7 @@ class ProductionPatch(unittest.TestCase):
         if backend.HAS_LIBSQL:
             self.db._conn=backend.libsql.connect(path)
         else:self.db._conn=sqlite3.connect(path)
-        for file in ['base_schema_fixture.sql','migration.sql']:
+        for file in ['base_schema_fixture.sql','migration.sql','../brain_service/migration.sql']:
             connection=self.db._conn
             sql=(ROOT/file).read_text()
             if hasattr(connection,'executescript'):connection.executescript(sql)

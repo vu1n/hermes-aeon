@@ -17,6 +17,15 @@ data. Tone tests run standalone; full provider lifecycle tests require the
 Hermes host runtime and otherwise skip explicitly. Set PYTHONPATH to that
 runtime when running the provider tests. Embedding uses the `none` provider.
 
+The [general foundation](general-brain-foundation.md) fixtures explicitly apply
+`brain_service/migration.sql` after the existing shared-writer migration. Its
+tests cover two agents, immutable imports, complete snapshots, transactional
+rollback, CAS and replay, topic/context filters, general index watermarks,
+expiry, stale-index revocation and synthetic restricted-content canaries.
+Provider tests exercise the same policy across recall and digest, including
+missing-schema fail-closed behavior. No production migration or real records
+are needed. The new gateway is a library boundary, not a deployed service.
+
 For systemd path/service/timer behavior, run `systemd_fixture.py` in an isolated
 Linux user manager. It creates uniquely named transient units and temporary
 synthetic stores, injects a failure, checks concurrent/completion-window writes
