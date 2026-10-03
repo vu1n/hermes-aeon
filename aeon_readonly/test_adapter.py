@@ -120,7 +120,7 @@ class AdapterTests(unittest.TestCase):
             with self.assertRaises(Invalid):self.store.call('aeon_get',args)
 
     def test_deep_json_is_rejected_and_stdio_session_survives(self):
-        deep=b'['*2000+b'0'+b']'*2000+b'\n'
+        deep=b'['*20000+b'0'+b']'*20000+b'\n'
         ping=json.dumps({'jsonrpc':'2.0','id':1,'method':'ping'}).encode()+b'\n'
         stdout=io.StringIO();serve(self.store,io.BytesIO(deep+ping),stdout)
         replies=[json.loads(line) for line in stdout.getvalue().splitlines()]

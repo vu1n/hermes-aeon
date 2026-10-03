@@ -156,7 +156,7 @@ class Writes(unittest.TestCase):
             request={'operation':'capture','arguments':{'request_id':'socket','domain':'work','kind':'preference','attribution_basis':'user_explicit','statement':'Prefer concise replies'}}
             a=send(request);self.assertTrue(a['ok']);self.assertEqual(a,send(request))
             with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
-                sock.connect(path);sock.sendall(b'['*2000+b'0'+b']'*2000+b'\n')
+                sock.connect(path);sock.sendall(b'['*20000+b'0'+b']'*20000+b'\n')
                 self.assertEqual(json.loads(sock.makefile('rb').readline())['error']['code'],'write_unavailable')
             self.assertEqual(a,send(request))
             server.consumers={os.getuid()+100000:'other'}

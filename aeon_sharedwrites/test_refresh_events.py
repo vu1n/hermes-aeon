@@ -26,7 +26,7 @@ class Refresh(unittest.TestCase):
         return writer.capture(self.db,consumer_id=consumer,request_id=request,type='note',domain='work',source='chat:'+consumer,content='Synthetic project direction',entry_kind='idea',attribution_basis='user_explicit',**kwargs)
 
     def test_deep_json_is_rejected_and_shared_stdio_survives(self):
-        deep=b'['*2000+b'0'+b']'*2000+b'\n'
+        deep=b'['*20000+b'0'+b']'*20000+b'\n'
         ping=json.dumps({'jsonrpc':'2.0','id':1,'method':'ping'}).encode()+b'\n'
         stdout=io.StringIO()
         mcp_adapter.reader.serve(None,io.BytesIO(deep+ping),stdout)
