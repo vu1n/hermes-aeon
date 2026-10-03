@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh filtered Aeon projection after canonical commits
+
+[Path]
+PathExists=/var/lib/aeon-events/dirty
+Unit=aeon-dot-refresh.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,14 @@
 """Typed query layer. JSON columns hydrated at the boundary — callers never see raw JSON."""
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
-from utils import safe_json_loads
+from .utils import safe_json_loads
+from . import shared_writer
 
 from .db import AeonDB, emb_to_libsql_literal
 
@@ -42,6 +42,7 @@ class MemoryItem:
     accessed_at: Optional[int] = None
     access_count: int = 0
     user_id: str = "local"
+    current_revision: int = 1
 
     def to_dict(self) -> dict:
         return {
@@ -52,7 +53,7 @@ class MemoryItem:
             "quality_score": self.quality_score, "source": self.source,
             "captured_at": self.captured_at, "event_start": self.event_start,
             "event_end": self.event_end, "accessed_at": self.accessed_at,
-            "access_count": self.access_count,
+            "access_count": self.access_count, "current_revision": self.current_revision,
         }
 
 
@@ -69,119 +70,33 @@ def _hydrate_row(row: tuple) -> MemoryItem:
         project_id=project_id, quality_score=quality_score, source=source,
         captured_at=captured_at, event_start=event_start, event_end=event_end,
         accessed_at=accessed_at, access_count=access_count or 0,
+        current_revision=_rest[0] if _rest else 1,
     )
 
 
 _SELECT_COLS = ("id, user_id, type, domain, status, title, summary, content, url, "
                 "entities, tags, summary_bullets, project_id, quality_score, source, "
-                "captured_at, event_start, event_end, accessed_at, access_count")
+                "captured_at, event_start, event_end, accessed_at, access_count, current_revision")
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def capture_memory(
-    db: AeonDB,
-    *,
-    type: str,
-    domain: str,
-    title: Optional[str] = None,
-    summary: Optional[str] = None,
-    content: Optional[str] = None,
-    url: Optional[str] = None,
-    tags: Optional[list] = None,
-    entities: Optional[dict] = None,
-    project_id: Optional[str] = None,
-    source: Optional[str] = None,
-    event_start: Optional[int] = None,
-    event_end: Optional[int] = None,
-    dedup_key: Optional[str] = None,
-    quality_score: Optional[float] = None,
-    captured_at: Optional[int] = None,
-    embedding: Optional[list[float]] = None,
-    embedding_model: Optional[str] = None,
-) -> str:
-    """Insert a memory_item + first revision + optional embedding. Returns the new id.
+def capture_memory(db,*,type,domain,title=None,summary=None,content=None,url=None,tags=None,
+    entities=None,project_id=None,source=None,event_start=None,event_end=None,dedup_key=None,
+    quality_score=None,captured_at=None,embedding=None,embedding_model=None,request_id=None):
+    return shared_writer.capture(db,consumer_id='hermes',request_id=request_id or uuid.uuid4().hex,
+        type=type,domain=domain,title=title,summary=summary,content=content,url=url,tags=tags,
+        entities=entities,project_id=project_id,source=source,event_start=event_start,event_end=event_end,
+        dedup_key=dedup_key,quality_score=quality_score,captured_at=captured_at,embedding=embedding,
+        embedding_model=embedding_model)['memory_id']
 
-    captured_at defaults to now; pass an explicit ms timestamp when importing
-    historical data (e.g. GitHub events, Oura daily summaries from prior days).
-    """
-    if domain not in VALID_DOMAINS:
-        raise ValueError(f"unknown domain: {domain}")
-    if type not in VALID_TYPES:
-        raise ValueError(f"unknown type: {type}")
-
-    if dedup_key:
-        existing = db.execute(
-            "SELECT id FROM memory_items WHERE dedup_key = ? LIMIT 1", (dedup_key,)
-        ).fetchone()
-        if existing:
-            return existing[0]
-
-    mid = uuid.uuid4().hex
-    ts = captured_at if captured_at is not None else now_ms()
-    db.execute(
-        """INSERT INTO memory_items
-           (id, user_id, type, domain, status, title, summary, content, url,
-            entities, tags, summary_bullets, project_id, quality_score, source,
-            captured_at, event_start, event_end, dedup_key, current_revision)
-           VALUES (?, 'local', ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
-        (mid, type, domain, title, summary, content, url,
-         json.dumps(entities or {}), json.dumps(tags or []), json.dumps([]),
-         project_id, quality_score, source, ts, event_start, event_end, dedup_key),
-    )
-    db.execute(
-        "INSERT INTO memory_revisions (memory_id, revision_n, content, summary, source, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-        (mid, content, summary, source, ts),
-    )
-    db.execute(
-        "INSERT INTO memory_fts (memory_id, title, summary, content) VALUES (?, ?, ?, ?)",
-        (mid, title or "", summary or "", content or ""),
-    )
-    if embedding and db.has_vector:
-        db.execute(
-            "INSERT INTO memory_embeddings (memory_id, embedding, model, embedded_at) VALUES (?, vector32(?), ?, ?)",
-            (mid, emb_to_libsql_literal(embedding), embedding_model or "unknown", ts),
-        )
-    db.commit()
-    return mid
-
-
-def update_memory_content(
-    db: AeonDB, *, memory_id: str, content: Optional[str], summary: Optional[str], source: Optional[str],
-    embedding: Optional[list[float]] = None, embedding_model: Optional[str] = None,
-) -> int:
-    """Append a revision. Returns the new revision number."""
-    row = db.execute(
-        "SELECT current_revision, title FROM memory_items WHERE id = ?", (memory_id,)
-    ).fetchone()
-    if not row:
-        raise ValueError(f"memory_id not found: {memory_id}")
-    next_rev = (row[0] or 1) + 1
-    title = row[1]
-    ts = now_ms()
-    db.execute(
-        "INSERT INTO memory_revisions (memory_id, revision_n, content, summary, source, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (memory_id, next_rev, content, summary, source, ts),
-    )
-    db.execute(
-        "UPDATE memory_items SET content = ?, summary = ?, current_revision = ? WHERE id = ?",
-        (content, summary, next_rev, memory_id),
-    )
-    db.execute("DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,))
-    db.execute(
-        "INSERT INTO memory_fts (memory_id, title, summary, content) VALUES (?, ?, ?, ?)",
-        (memory_id, title or "", summary or "", content or ""),
-    )
-    if embedding and db.has_vector:
-        db.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-        db.execute(
-            "INSERT INTO memory_embeddings (memory_id, embedding, model, embedded_at) VALUES (?, vector32(?), ?, ?)",
-            (memory_id, emb_to_libsql_literal(embedding), embedding_model or "unknown", ts),
-        )
-    db.commit()
-    return next_rev
+def update_memory_content(db,*,memory_id,expected_revision,content,summary,source,
+    embedding=None,embedding_model=None,request_id=None):
+    return shared_writer.update(db,consumer_id='hermes',request_id=request_id or uuid.uuid4().hex,
+        memory_id=memory_id,expected_revision=expected_revision,content=content,summary=summary,
+        source=source,embedding=embedding,embedding_model=embedding_model)['revision']
 
 
 def search_memories(

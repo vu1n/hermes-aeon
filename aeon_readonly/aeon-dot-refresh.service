@@ -1,0 +1,28 @@
+[Unit]
+Description=Refresh source-filtered read-only Aeon transport view
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/aeon-readonly/publish.py --source /root/.hermes/aeon.db --output /var/lib/aeon-dot/approved-kb.sqlite --reader-group dot
+TimeoutStartSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateNetwork=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=/root/.hermes/aeon.db
+BindReadOnlyPaths=-/root/.hermes/aeon.db-wal
+BindReadOnlyPaths=-/root/.hermes/aeon.db-shm
+ReadWritePaths=/var/lib/aeon-dot
+CapabilityBoundingSet=CAP_CHOWN
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

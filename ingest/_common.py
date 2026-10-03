@@ -108,13 +108,13 @@ def upsert_profile(db, content: str, summary: Optional[str] = None) -> str:
     from store import queries as q
     from store.embed import embed_text
     existing = db.execute(
-        "SELECT id FROM memory_items WHERE dedup_key = ? LIMIT 1",
+        "SELECT id, current_revision FROM memory_items WHERE dedup_key = ? LIMIT 1",
         (PROFILE_DEDUP_KEY,),
     ).fetchone()
     emb, model = embed_text(content, provider=os.environ.get("HERMES_AEON_EMBED", "gemini"))
     if existing:
         mid = existing[0]
-        q.update_memory_content(db, memory_id=mid, content=content,
+        q.update_memory_content(db, memory_id=mid, expected_revision=existing[1], content=content,
                                 summary=summary, source="cron:derive_profile",
                                 embedding=emb, embedding_model=model)
     else:

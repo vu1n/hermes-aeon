@@ -7,4 +7,8 @@ __pycache__/
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 .DS_Store
