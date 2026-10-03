@@ -119,6 +119,14 @@ class AdapterTests(unittest.TestCase):
         for args in [None,[],{"id":"' OR 1=1"},{"id":True}]:
             with self.assertRaises(Invalid):self.store.call('aeon_get',args)
 
+    def test_deep_json_is_rejected_and_stdio_session_survives(self):
+        deep=b'['*2000+b'0'+b']'*2000+b'\n'
+        ping=json.dumps({'jsonrpc':'2.0','id':1,'method':'ping'}).encode()+b'\n'
+        stdout=io.StringIO();serve(self.store,io.BytesIO(deep+ping),stdout)
+        replies=[json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(replies[0]['error']['code'],-32602)
+        self.assertEqual(replies[1],{'jsonrpc':'2.0','id':1,'result':{}})
+
     def make_source(self):
         raw=self.root/'source.sqlite';db=sqlite3.connect(raw)
         types=['TEXT']*len(SOURCE_FIELDS)

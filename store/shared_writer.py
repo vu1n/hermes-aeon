@@ -53,9 +53,9 @@ class Invalid(WriteError):
     code = "invalid_write"
 
 
-def text(value, maximum, optional=True):
+def text(value, maximum=None, optional=True):
     if value is None and optional:return None
-    if not isinstance(value,str) or len(value)>maximum:raise Invalid()
+    if not isinstance(value,str) or (maximum is not None and len(value)>maximum):raise Invalid()
     return value
 
 def identity(value):
@@ -80,7 +80,6 @@ def provenance(consumer_id,request_id,entry_kind,attribution_basis,conversation_
 def _digest(value):
     try:data=json.dumps(value,sort_keys=True,separators=(",",":"),allow_nan=False)
     except (ValueError,TypeError):raise Invalid()
-    if len(data)>1_000_000:raise Invalid()
     return hashlib.sha256(data.encode()).hexdigest()
 
 def _busy(exc):
@@ -134,8 +133,10 @@ def _audit(db,mid,revision,operation,meta,now,point):
     point('after_audit')
 
 def _embedding(db,mid,embedding,model,now,replace=False):
+    # A plain SQLite broker must invalidate vectors written by a vector-capable producer.
+    if replace and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_embeddings'").fetchone():
+        db.execute("DELETE FROM memory_embeddings WHERE memory_id=?",(mid,))
     if not embedding or not getattr(db,'has_vector',False):return
-    if replace:db.execute("DELETE FROM memory_embeddings WHERE memory_id=?",(mid,))
     literal='['+','.join(f'{v:.6f}' for v in embedding)+']'
     db.execute("INSERT INTO memory_embeddings(memory_id,embedding,model,embedded_at) VALUES(?,vector32(?),?,?)",(mid,literal,model or 'unknown',now))
 
@@ -146,11 +147,12 @@ def capture(db,*,consumer_id,request_id,type,domain,title=None,summary=None,cont
             checkpoint=None,retries=3):
     meta=provenance(consumer_id,request_id,entry_kind,attribution_basis,conversation_ref)
     if domain not in DOMAINS or type not in TYPES:raise Invalid()
-    for v,n in [(title,300),(summary,2000),(content,100000),(url,2048),(source,128),(project_id,128),(dedup_key,512),(embedding_model,128)]:text(v,n)
+    # Size policy belongs to the untrusted broker boundary, not Hermes' canonical API.
+    for v in [title,summary,content,url,source,project_id,dedup_key,embedding_model]:text(v)
     for v in [event_start,event_end,captured_at]:number(v)
     if quality_score is not None and (type_of(quality_score) not in (int,float) or not math.isfinite(quality_score)):raise Invalid()
     tags=[] if tags is None else tags;entities={} if entities is None else entities
-    if not isinstance(tags,list) or len(tags)>100 or any(not isinstance(t,str) or len(t)>128 for t in tags) or not isinstance(entities,dict):raise Invalid()
+    if not isinstance(tags,list) or any(not isinstance(t,str) for t in tags) or not isinstance(entities,dict):raise Invalid()
     validate_embedding(embedding)
     payload={"type":type,"domain":domain,"title":title,"summary":summary,"content":content,"url":url,"tags":tags,"entities":entities,"project_id":project_id,"source":source,"event_start":event_start,"event_end":event_end,"dedup_key":dedup_key,"quality_score":quality_score,"captured_at":captured_at,"embedding":embedding,"embedding_model":embedding_model}
     def action(now,point):
@@ -177,7 +179,7 @@ def update(db,*,consumer_id,request_id,memory_id,expected_revision,content,summa
     meta=provenance(consumer_id,request_id,entry_kind,attribution_basis,conversation_ref)
     if not isinstance(memory_id,str) or not re.fullmatch(r'[a-f0-9]{32}',memory_id):raise Invalid()
     if type(expected_revision) is not int or expected_revision<1:raise Invalid()
-    text(content,100000);text(summary,2000);text(source,128);text(embedding_model,128)
+    text(content);text(summary);text(source);text(embedding_model)
     validate_embedding(embedding)
     payload={"id":memory_id,"expected_revision":expected_revision,"content":content,"summary":summary,"source":source,"embedding":embedding,"embedding_model":embedding_model,"eligible_sources":sorted(eligible_sources) if eligible_sources is not None else None,"eligible_domains":sorted(eligible_domains) if eligible_domains is not None else None}
     def action(now,point):

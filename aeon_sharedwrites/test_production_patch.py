@@ -56,6 +56,18 @@ class ProductionPatch(unittest.TestCase):
         mid=queries.capture_memory(self.db,type='task',domain='work',title='Synthetic task',source='manual')
         self.assertIsInstance(mid,str)
 
+    def test_hermes_large_capture_update_and_idempotency_keep_compatibility(self):
+        content='Synthetic extracted page '+('x'*1000001)
+        title='t'*301;summary='s'*2001;tags=['tag'+str(i) for i in range(101)]+['z'*129]
+        args=dict(type='link',domain='learning',title=title,summary=summary,content=content,
+                  tags=tags,source='manual',request_id='large')
+        mid=queries.capture_memory(self.db,**args)
+        self.assertEqual(mid,queries.capture_memory(self.db,**args))
+        self.assertEqual(self.db.execute('SELECT title,summary,content FROM memory_items WHERE id=?',(mid,)).fetchone(),(title,summary,content))
+        corrected=content+' corrected'
+        self.assertEqual(queries.update_memory_content(self.db,memory_id=mid,expected_revision=1,content=corrected,summary=summary,source='manual',request_id='large-update'),2)
+        self.assertEqual(self.db.execute('SELECT content FROM memory_items WHERE id=?',(mid,)).fetchone()[0],corrected)
+
     def test_actual_provider_schema_handler_conflict(self):
         tree=ast.parse((PATCHED/'provider.py').read_text())
         schema=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='UPDATE_SCHEMA' for t in n.targets))

@@ -257,7 +257,7 @@ def serve(store, stdin=sys.stdin.buffer, stdout=sys.stdout):
             emit({"jsonrpc": "2.0", "id": rid, "result": result})
         except json.JSONDecodeError:
             emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid JSON"}})
-        except (ValueError, TypeError, KeyError, AttributeError):
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
             emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid request or tool arguments"}})
         except (sqlite3.Error, OSError, Unavailable):
             emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "Read unavailable or query exceeded budget"}})

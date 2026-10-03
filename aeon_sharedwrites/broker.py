@@ -96,7 +96,7 @@ class Handler(socketserver.StreamRequestHandler):
             info={'code':error.code}
             if isinstance(error,writer.Conflict):info['current_revision']=error.current_revision
             self.reply({'ok':False,'error':info})
-        except (ValueError,TypeError,KeyError,sqlite3.Error,OSError):
+        except (ValueError,TypeError,KeyError,RecursionError,sqlite3.Error,OSError):
             self.reply({'ok':False,'error':{'code':'write_unavailable'}})
         finally:
             if db is not None:db.close()

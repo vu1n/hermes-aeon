@@ -155,6 +155,10 @@ class Writes(unittest.TestCase):
         try:
             request={'operation':'capture','arguments':{'request_id':'socket','domain':'work','kind':'preference','attribution_basis':'user_explicit','statement':'Prefer concise replies'}}
             a=send(request);self.assertTrue(a['ok']);self.assertEqual(a,send(request))
+            with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
+                sock.connect(path);sock.sendall(b'['*2000+b'0'+b']'*2000+b'\n')
+                self.assertEqual(json.loads(sock.makefile('rb').readline())['error']['code'],'write_unavailable')
+            self.assertEqual(a,send(request))
             server.consumers={os.getuid()+100000:'other'}
             self.assertEqual(send(request)['error']['code'],'unauthorized_peer')
         finally:server.shutdown();server.server_close();t.join()
@@ -175,7 +179,32 @@ class Writes(unittest.TestCase):
         self.assertEqual(c.execute('SELECT count(*) FROM memory_embeddings').fetchone()[0],0)
         result=self.capture(db,embedding=[.1,.2]);self.assertEqual(c.execute('SELECT count(*) FROM memory_embeddings').fetchone()[0],1)
         with self.assertRaises(RuntimeError):w.update(db,consumer_id='dot',request_id='u',memory_id=result['memory_id'],expected_revision=1,content='Changed',embedding=[.3,.4],checkpoint=fail)
-        self.assertIn('0.100000',c.execute('SELECT embedding FROM memory_embeddings').fetchone()[0]);c.close()
+        self.assertIn('0.100000',c.execute('SELECT embedding FROM memory_embeddings').fetchone()[0])
+        w.update(db,consumer_id='dot',request_id='replacement',memory_id=result['memory_id'],expected_revision=1,content='Changed',embedding=[.3,.4])
+        self.assertEqual(c.execute('SELECT embedding FROM memory_embeddings').fetchall(),[('[0.300000,0.400000]',)]);c.close()
+
+    def test_broker_correction_invalidates_hermes_vector_atomically(self):
+        c=self.connect();mid=self.capture(c)['memory_id']
+        c.execute('CREATE TABLE memory_embeddings(memory_id TEXT PRIMARY KEY,embedding TEXT,model TEXT,embedded_at INTEGER)')
+        c.execute('INSERT INTO memory_embeddings VALUES(?,?,?,?)',(mid,'old-vector','synthetic',1))
+        def fail(stage):
+            if stage=='after_embedding':raise RuntimeError('synthetic failure')
+        with self.assertRaises(RuntimeError):
+            w.update(c,consumer_id='dot',request_id='rollback',memory_id=mid,expected_revision=1,content='Changed',checkpoint=fail)
+        self.assertEqual(c.execute('SELECT embedding FROM memory_embeddings').fetchone()[0],'old-vector')
+        args=dict(request_id='correction',memory_id=mid,expected_revision=1,kind='decision',attribution_basis='user_corrected',statement='Corrected project direction')
+        result=broker.operation(c,'dot',{'operation':'update','arguments':args})
+        self.assertEqual(result['revision'],2)
+        self.assertEqual(c.execute('SELECT count(*) FROM memory_embeddings').fetchone()[0],0)
+        self.assertEqual(result,broker.operation(c,'dot',{'operation':'update','arguments':args}));c.close()
+
+    def test_broker_limits_remain_enforced(self):
+        c=self.connect()
+        args=dict(request_id='oversize',domain='work',kind='idea',attribution_basis='user_explicit',statement='A project idea')
+        for extra in [dict(statement='x'*4001),dict(title='x'*301),dict(summary='x'*1001)]:
+            with self.subTest(extra=next(iter(extra))),self.assertRaises(w.Invalid):
+                broker.operation(c,'dot',{'operation':'capture','arguments':args|extra})
+        self.assertEqual(self.counts(c),[0]*5);c.close()
 
     def test_long_legacy_timeout_is_temporarily_bounded_and_restored(self):
         holder=self.connect();holder.execute('BEGIN IMMEDIATE')
