@@ -1,5 +1,4 @@
 import importlib.util
-import os
 import sqlite3
 import sys
 import tempfile

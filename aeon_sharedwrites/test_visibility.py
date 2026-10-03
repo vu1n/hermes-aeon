@@ -1,6 +1,5 @@
 """Only synthetic notes; source and projection both live in temporary directories."""
 import importlib.util
-import json
 import sqlite3
 import os
 import sys

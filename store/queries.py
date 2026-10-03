@@ -1,12 +1,11 @@
 """Typed query layer. JSON columns hydrated at the boundary — callers never see raw JSON."""
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 from .utils import safe_json_loads
 from . import shared_writer

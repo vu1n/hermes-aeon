@@ -1,7 +1,6 @@
 """Exercise actual staged production definitions, with synthetic storage/API stubs."""
 import ast
 import importlib.util
-import json
 import sqlite3
 import sys
 import tempfile
