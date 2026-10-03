@@ -1,6 +1,5 @@
 import io
 import json
-import importlib.util
 import sqlite3
 import sys
 import tempfile
@@ -10,8 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 from aeon_sharedwrites import broker, mcp_adapter, shared_writer as writer
 
-spec=importlib.util.spec_from_file_location('fixture_refresh_event',Path(__file__).with_name('read_adapter')/'refresh_event.py')
-events=importlib.util.module_from_spec(spec);spec.loader.exec_module(events)
+from aeon_sharedwrites.read_adapter import refresh_event as events
 
 class Refresh(unittest.TestCase):
     def setUp(self):

@@ -17,10 +17,12 @@ import threading
 import time
 from pathlib import Path
 
-try:
+if __package__:
     from . import shared_writer as writer
-except ImportError:
+    from .read_adapter import projection
+else:
     writer = None  # Direct CLI loads the explicit root-controlled module in main.
+    from read_adapter import projection
 
 DOMAINS = {'work','side_projects','learning'}
 KINDS = {'idea','decision','preference','project_context'}
@@ -44,9 +46,8 @@ def current_note(db, consumer, args):
     """Immediate owned-note read, using the SAME screening as the projection."""
     if not isinstance(args,dict) or set(args)!={'id'} or not isinstance(args['id'],str) or not re.fullmatch('[a-f0-9]{32}',args['id']):
         raise writer.Invalid()
-    spec=importlib.util.spec_from_file_location('broker_projection_rules',Path(__file__).with_name('read_adapter')/'adapter.py')
-    rules=importlib.util.module_from_spec(spec);spec.loader.exec_module(rules)
-    fields=tuple(k for k in rules.FIELDS if k not in {'provenance_json','screened_at','scope_version'})
+    policy = projection.SHARED
+    fields = policy.source_fields
     db.execute('BEGIN')
     try:
         raw=db.execute('SELECT '+','.join(fields)+' FROM memory_items WHERE id=? AND source=?',(args['id'],'chat:'+consumer)).fetchone()
@@ -54,9 +55,9 @@ def current_note(db, consumer, args):
         row=dict(zip(fields,raw))
         audit=db.execute('SELECT consumer_id,entry_kind,attribution_basis,conversation_ref,created_at FROM memory_write_audit WHERE memory_id=? AND revision_n=?',(row['id'],row['current_revision'])).fetchone()
         if audit is None:return {'item':None,'owned':True}
-        row.update(screened_at=int(time.time()*1000),scope_version=rules.SCOPE,
-            provenance_json=json.dumps(dict(consumer_id=audit[0],kind=audit[1],attribution_basis=audit[2],conversation_ref=audit[3],created_at=audit[4],revision=row['current_revision'])))
-        return {'item':rules.Store.safe(row,full=True),'owned':True}
+        row.update(screened_at=int(time.time()*1000),scope_version=policy.scope,
+            provenance_json=projection.provenance_json(audit, row['current_revision']))
+        return {'item':projection.screen(row, policy, full=True),'owned':True}
     finally:
         db.execute('ROLLBACK')
 

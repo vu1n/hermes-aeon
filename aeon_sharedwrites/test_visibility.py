@@ -1,5 +1,4 @@
 """Only synthetic notes; source and projection both live in temporary directories."""
-import importlib.util
 import sqlite3
 import os
 import sys
@@ -10,9 +9,7 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 from aeon_sharedwrites import broker, mcp_adapter, shared_writer
 
-spec=importlib.util.spec_from_file_location('shared_projection_publish',Path(__file__).with_name('read_adapter')/'publish.py')
-publisher=importlib.util.module_from_spec(spec)
-spec.loader.exec_module(publisher)
+from aeon_sharedwrites.read_adapter import publish as publisher
 
 class Visibility(unittest.TestCase):
     @unittest.skipUnless(sys.platform=='linux','Linux Unix peer identity')

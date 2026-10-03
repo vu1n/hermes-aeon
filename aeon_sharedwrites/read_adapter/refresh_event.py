@@ -4,7 +4,10 @@ import argparse
 import os
 import time
 from pathlib import Path
-from publish import publish
+if __package__:
+    from .publish import publish
+else:
+    from publish import publish
 
 def refresh_once(source, output, marker, reader_group=None, coalesce=.2, publisher=publish, failure_backoff=0):
     # Clearing BEFORE the snapshot prevents dropping a concurrent later commit.

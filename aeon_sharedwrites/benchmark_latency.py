@@ -10,9 +10,9 @@ import threading
 import time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
-sys.path.insert(0,str(ROOT.parent));sys.path.insert(0,str(ROOT/'read_adapter'))
+sys.path.insert(0,str(ROOT.parent))
 from aeon_sharedwrites import broker,mcp_adapter,shared_writer as writer
-from publish import publish
+from aeon_sharedwrites.read_adapter.publish import publish
 
 def benchmark(source,trials=3):
     with tempfile.TemporaryDirectory(prefix='aeon-private-latency-') as directory:

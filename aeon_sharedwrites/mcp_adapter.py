@@ -3,11 +3,11 @@
 import argparse
 import json
 import socket
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).with_name('read_adapter')))
-import adapter as reader
+if __package__:
+    from .read_adapter import adapter as reader
+else:
+    from read_adapter import adapter as reader
 
 READ_TOOLS = reader.tools
 
@@ -34,6 +34,11 @@ class Store(reader.Store):
     def __init__(self, db, broker_socket):
         super().__init__(db)
         self.broker_socket = broker_socket
+
+    @classmethod
+    def open_projection(cls, path):
+        # Refresh only the read connection; broker identity/socket stay on this instance.
+        return reader.Store(path)
 
     def call(self, name, args):
         if name=='aeon_get':
@@ -68,7 +73,6 @@ def main():
     parser.add_argument('--db',required=True)
     parser.add_argument('--broker-socket',required=True)
     args=parser.parse_args()
-    reader.tools=tools
-    reader.serve(Store(args.db,args.broker_socket))
+    reader.serve(Store(args.db,args.broker_socket), tool_definitions=tools)
 
 if __name__=='__main__': main()

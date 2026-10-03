@@ -74,7 +74,13 @@ Install the transport-only `aeon_sharedwrites` directory at
 `/opt/aeon-sharedwrites`, also root-owned/non-writable. The broker loads the exact
 canonical `/opt/hermes-aeon/store/shared_writer.py` using `--shared-module`;
 there is no separately maintained writer implementation. The consumer need not
-receive access to the Hermes plugin tree.
+receive access to the Hermes plugin tree. Copy the canonical
+`aeon_readonly/projection` package from that same reviewed commit into
+`/opt/aeon-sharedwrites/read_adapter/projection`. This is an installation copy of
+one shared implementation, not a separately maintained projection stack. Keep
+it root-owned and non-writable with the rest of the transport code. The broker
+imports only its pure screening/provenance package; it does not load the MCP
+reader for each request.
 
 ## 4. Review permissions and service templates
 

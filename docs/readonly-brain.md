@@ -47,3 +47,8 @@ Back up units/transport configuration and restore them if checks fail.
 For shared writes, use the separate explicit migration and narrowly scoped broker
 in [shared-brain-deployment.md](shared-brain-deployment.md). Do not write into
 this projection or treat it as another canonical store.
+
+The standalone installation must include the complete `aeon_readonly/projection`
+package alongside `adapter.py`, `publish.py` and `projection_schema.sql`. The
+research entrypoints select the research policy explicitly; they do not gain
+chat-note visibility when the same core is used by the shared-note transport.

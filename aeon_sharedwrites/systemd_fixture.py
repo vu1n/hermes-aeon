@@ -16,9 +16,8 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT.parent))
-sys.path.insert(0,str(ROOT/'read_adapter'))
 from aeon_sharedwrites import shared_writer as writer
-import refresh_event
+from aeon_sharedwrites.read_adapter import refresh_event
 
 def append(path,event):
     with path.open('a') as stream:stream.write(json.dumps(event)+'\n')
