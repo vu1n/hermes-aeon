@@ -45,6 +45,19 @@ def general_envelope(item,metadata,now):
     if metadata['sensitivity']!='general' or not metadata.get('valid',True):return False
     if item['domain'] not in DOMAINS or item['status']!='active':return False
     if metadata['expires_at'] is not None and metadata['expires_at']<=now:return False
-    # Inspect the whole envelope, including topic, source/reference and provenance metadata.
-    envelope=json.dumps({'item':item,'metadata':metadata},ensure_ascii=True,sort_keys=True)
-    return len(envelope)<=150000 and not UNSAFE.search(envelope)
+    try:
+        envelope=json.dumps({'item':item,'metadata':metadata},ensure_ascii=True,sort_keys=True)
+    except (TypeError,ValueError,RecursionError):return False
+    if len(envelope)>150000:return False
+    # JSON escaping changes whitespace and word boundaries; screen decoded strings.
+    pending=[item,metadata]
+    while pending:
+        value=pending.pop()
+        if isinstance(value,str):
+            if UNSAFE.search(value):return False
+        elif isinstance(value,dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value,(list,tuple)):
+            pending.extend(value)
+    return True

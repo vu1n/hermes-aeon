@@ -2,13 +2,14 @@
 import concurrent.futures
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
-from brain_service.policy import API_VERSION, HERMES, Principal, Denied, Invalid, Unavailable
+from brain_service.policy import API_VERSION, HERMES, Principal, Denied, Invalid, Unavailable, general_envelope
 from brain_service.service import Service, now_ms
 from brain_service.gateway import Gateway
 from brain_service.migrate import migrate
@@ -218,6 +219,133 @@ class GeneralService(unittest.TestCase):
         self.revise(mid,{'sensitivity':'restricted_health'})
         self.assertIsNone(self.service.get(BETA,view))
         with self.assertRaises(Denied):self.capture(DERIVER,request='restricted-view',record_class='derived_view',evidence_refs=[dict(ref,revision=2)])
+
+    def test_shared_lineage_is_memoized_without_losing_live_revocation(self):
+        all_ids=[]
+        layer=[]
+        for number in range(4):
+            layer.append(self.capture(request='leaf'+str(number))['memory_id'])
+        all_ids.extend(layer)
+        for level in range(4):
+            refs=[dict(memory_id=mid,revision=1,relationship='supports') for mid in layer]
+            layer=[self.capture(request=f'layer{level}-{number}',evidence_refs=refs)['memory_id'] for number in range(4)]
+            all_ids.extend(layer)
+        root=self.capture(request='graph-root',evidence_refs=[dict(memory_id=mid,revision=1,relationship='supports') for mid in layer])['memory_id']
+        with patch.object(self.service,'_item',wraps=self.service._item) as load:
+            self.assertIsNotNone(self.service.get(BETA,root))
+            self.assertEqual(load.call_count,len(all_ids)+1)
+        self.revise(all_ids[0],{'sensitivity':'restricted_health'})
+        self.assertIsNone(self.service.get(BETA,root))
+
+    def test_lineage_memo_preserves_depth_limit_for_shared_shortcuts(self):
+        leaf=self.capture(request='depth-leaf')['memory_id']
+        chain=[leaf]
+        for number in range(8):
+            chain.append(self.capture(request='depth'+str(number),evidence_refs=[dict(memory_id=chain[-1],revision=1,relationship='supports')])['memory_id'])
+        self.assertIsNotNone(self.service.get(BETA,chain[-1]))
+        root=self.capture(request='too-deep',evidence_refs=[dict(memory_id=mid,revision=1,relationship='supports') for mid in [chain[1],chain[-1]]])
+        self.assertEqual(root['search_visibility'],'ineligible')
+        self.assertIsNone(self.service.get(BETA,root['memory_id']))
+
+    def test_recall_budget_is_shared_and_exhaustion_never_returns_partial_results(self):
+        first=self.capture(request='first')['memory_id']
+        self.capture(request='second')
+        with patch('brain_service.service.MAX_LINEAGE_WORK',1):
+            self.assertIsNotNone(self.service.get(BETA,first))
+            self.assertIsNotNone(self.service.get(BETA,first))
+            for operation,args in [('search',{'query':'project'}),('recent',{}),('interests',{})]:
+                result=self.gateway.handle_peer(1002,dict(api_version=API_VERSION,operation=operation,arguments=args))
+                self.assertEqual(result,{'ok':False,'error':{'code':'general_unavailable'}})
+        self.assertEqual(self.service.recent(BETA)['count'],2)
+        forged=self.gateway.handle_peer(1002,dict(api_version=API_VERSION,operation='recent',arguments={'budget':1000000}))
+        self.assertEqual(forged['error']['code'],'invalid_request')
+
+    def test_lineage_budget_exhaustion_rolls_back_write_and_allows_retry(self):
+        mid=self.capture()['memory_id']
+        args=self.args('budget-write',evidence_refs=[dict(memory_id=mid,revision=1,relationship='supports')])
+        before=self.counts()
+        with patch('brain_service.service.MAX_LINEAGE_WORK',1):
+            result=self.gateway.handle_peer(1001,dict(api_version=API_VERSION,operation='capture',arguments=args))
+            self.assertEqual(result,{'ok':False,'error':{'code':'general_unavailable'}})
+        self.assertEqual(self.counts(),before)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM brain_general_fts').fetchone()[0],1)
+        committed=self.service.capture(ALPHA,args)
+        self.assertEqual(committed['search_visibility'],'visible')
+        self.assertEqual(committed,self.service.capture(ALPHA,args))
+        view=self.capture(DERIVER,request='budget-view',record_class='derived_view',
+                          evidence_refs=[dict(memory_id=mid,revision=1,relationship='derived_from')])['memory_id']
+        before=self.counts()
+        with patch('brain_service.service.MAX_LINEAGE_WORK',0):
+            with self.assertRaises(Unavailable):self.revise(mid,{'statement':'Uncommitted replacement'})
+        self.assertEqual(self.counts(),before)
+        self.assertEqual(self.service.get(BETA,mid)['revision'],1)
+        self.assertIsNotNone(self.service.get(BETA,view))
+
+    def test_proposal_and_hermes_hook_budget_exhaustion_roll_back(self):
+        mid=self.capture()['memory_id']
+        args=dict(request_id='budget-proposal',memory_id=mid,expected_revision=1,
+                  statement='Alternative project direction',reason='Differing claim')
+        before=self.counts()
+        with patch('brain_service.service.MAX_LINEAGE_WORK',2):
+            result=self.gateway.handle_peer(1002,dict(api_version=API_VERSION,operation='propose',arguments=args))
+            self.assertEqual(result,{'ok':False,'error':{'code':'general_unavailable'}})
+        self.assertEqual(self.counts(),before)
+        proposed=self.service.propose(BETA,args)
+        self.assertEqual(proposed['search_visibility'],'visible')
+        self.assertEqual(proposed,self.service.propose(BETA,args))
+        before=self.counts()
+        with patch('brain_service.service.MAX_LINEAGE_WORK',0):
+            with self.assertRaises(Unavailable):
+                queries.capture_memory(self.db,type='note',domain='work',content='Synthetic Hermes project',source='manual',request_id='budget-hermes')
+        self.assertEqual(self.counts(),before)
+        hermes=queries.capture_memory(self.db,type='note',domain='work',content='Synthetic Hermes project',source='manual',request_id='budget-hermes')
+        self.assertIsNotNone(self.service.get(BETA,hermes))
+
+    def test_decoded_restricted_text_is_screened_on_admission_and_live_reads(self):
+        safe=self.capture()['memory_id']
+        cases=[dict(statement='Project\nmedical'),dict(statement='Synthetic credit\tcard detail'),
+               dict(title='Project\rmedical'),dict(summary='Synthetic credit\u2003card detail'),
+               dict(applicability='Project\nmedical'),dict(conversation_ref='Project\nmedical')]
+        for number,extra in enumerate(cases):
+            with self.subTest(extra=extra):
+                result=self.capture(request='decoded'+str(number),**extra)
+                self.assertEqual(result['search_visibility'],'ineligible')
+                self.assertIsNone(self.service.get(BETA,result['memory_id']))
+        # An old eligible index cannot bypass screening of current decoded nested values.
+        for entities in [{'nested':[{'description':'Project\nmedical'}]}, {'Project\nmedical':'value'}]:
+            self.db.execute('UPDATE memory_items SET entities=? WHERE id=?',(json.dumps(entities),safe))
+            self.assertIsNone(self.service.get(BETA,safe))
+            self.assertEqual(self.service.search(BETA,query='project')['count'],0)
+            self.assertEqual(self.service.recent(BETA)['total'],0)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM brain_general_changes').fetchone()[0],1)
+
+    def test_decoded_screening_preserves_general_multiline_text_and_envelope_bound(self):
+        result=self.capture(statement='Project notes\nCompiler work\tAgent research',summary='Synthetic general summary')
+        item=self.service.get(BETA,result['memory_id'])
+        self.assertIsNotNone(item)
+        self.assertEqual(self.service.search(BETA,query='compiler')['count'],1)
+        self.assertEqual(self.service.recent(BETA)['count'],1)
+        state=self.service._metadata(item['id'])
+        item['content']=''
+        size=len(json.dumps({'item':item,'metadata':state},ensure_ascii=True,sort_keys=True))
+        padding=150000-size
+        item['content']='x '*(padding//2)+'x'*(padding%2)
+        self.assertTrue(general_envelope(item,state,now_ms()))
+        item['content']+='x'
+        self.assertFalse(general_envelope(item,state,now_ms()))
+
+    def test_decoded_screening_long_general_runs_finish_and_email_detection_is_preserved(self):
+        # Bound the test process itself so a regex-performance regression cannot hang CI.
+        script="""
+from brain_service.policy import general_envelope
+item={'domain':'work','status':'active','content':'x'*140000}
+state={'sensitivity':'general','expires_at':None}
+assert general_envelope(item,state,0)
+for address in ['synthetic@example.invalid','...@example.invalid','_+%@example.invalid']:
+    item['content']=address
+    assert not general_envelope(item,state,0)
+"""
+        subprocess.run([sys.executable,'-c',script],cwd=ROOT,check=True,capture_output=True,timeout=5)
 
     def test_active_context_expires_without_creating_owner_preferences(self):
         a=self.capture(record_class='working_context',kind='preference',attribution_basis='user_explicit')

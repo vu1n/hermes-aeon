@@ -69,6 +69,18 @@ including metadata and provenance, receive the shared restricted-content screen.
 Keyword screening is defense in depth, not proof that arbitrary concealed or
 inferred health information is absent. Trusted classification and complete
 lineage remain necessary. Unknown legacy records are not automatically admitted.
+Screening visits decoded string values and object keys throughout the envelope;
+JSON escapes cannot change the screening regex's whitespace or word boundaries.
+The existing 150,000-character serialized-envelope limit still applies.
+
+Lineage checks memoize shared descendants within each live traversal, keyed by
+record, revision and depth. One 4,096-unit work budget is shared across each
+service operation's candidate reads and write validation/publication phases.
+Node visits and reference edges consume work, including cache hits. Exhaustion
+returns `general_unavailable` without partial results; an in-flight write rolls
+back atomically. Traversal caches never persist into another read or a later
+transaction recheck. The existing depth-eight and per-record reference limits
+remain in force.
 
 Hermes search, recent, prefetch, system prompt and digest use the common general
 policy. Digest revalidates input revisions after generation and discards a result
@@ -100,13 +112,12 @@ semantic indexing, owner attestation and health access are deferred. No service
 unit, credential, production configuration or migration is supplied by this
 foundation. See [testing.md](testing.md) for verification and its limits.
 
-## Review hold
+## Security remediation
 
-Independent static security review confirmed a medium-severity algorithmic
-complexity issue in the live lineage gate: shared descendants are revisited for
-each path. The per-record fanout and depth limits do not bound total traversal
-work tightly enough. Authenticated read/capture peers can create valid linked
-records that amplify eligibility work, including inside a writer transaction.
-Per-operation memoization and a traversal budget are required before deploying
-this general gateway. That remediation is awaiting separate authorization;
-this draft foundation must not be treated as ready for real-client deployment.
+The two confirmed medium-severity findings were excessive repeated traversal of
+shared lineage and screening JSON-escaped text. The bounded traversal and decoded
+screening above address them, with synthetic regressions for shared graphs,
+depth-sensitive memoization, live revocation, budget exhaustion and rollback,
+escaped whitespace, nested metadata, ordinary general text and envelope bounds.
+This code-only draft remains subject to the separately approved deployment
+decisions described above; these fixes do not install or expose the gateway.

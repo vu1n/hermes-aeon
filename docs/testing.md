@@ -25,6 +25,9 @@ expiry, stale-index revocation and synthetic restricted-content canaries.
 Provider tests exercise the same policy across recall and digest, including
 missing-schema fail-closed behavior. No production migration or real records
 are needed. The new gateway is a library boundary, not a deployed service.
+Security regressions verify bounded shared-lineage work, depth-sensitive caching,
+fresh revocation checks, no partial output on budget exhaustion, write rollback,
+decoded nested-string screening and preservation of the envelope size bound.
 
 For systemd path/service/timer behavior, run `systemd_fixture.py` in an isolated
 Linux user manager. It creates uniquely named transient units and temporary
