@@ -154,15 +154,6 @@ PULL_GITHUB_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
-PULL_OURA_SCHEMA = {
-    "name": "aeon_pull_oura",
-    "description": "Pull Oura daily summaries (sleep, activity, readiness, workouts). Incremental 3-day window by default; backfill=true uses OURA_BACKFILL_DAYS (30).",
-    "parameters": {"type": "object", "properties": {
-        "backfill": {"type": "boolean", "default": False},
-        "days": {"type": "integer", "description": "Override the window (overrides backfill/incremental defaults)."},
-    }},
-}
-
 PULL_RSS_SCHEMA = {
     "name": "aeon_pull_rss",
     "description": "Pull HN frontpage + Lobste.rs RSS, LLM-score each new item vs interest profile, capture above threshold (default 0.6) with quality_score.",
@@ -187,18 +178,9 @@ PULL_HYPE_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
-DERIVE_PROFILE_SCHEMA = {
-    "name": "aeon_derive_profile",
-    "description": "Re-derive the user's interest profile from recent X bookmarks (recency-weighted), upsert to profile memory (revisions track evolution). Returns {updated, bookmarks, profile_chars}.",
-    "parameters": {"type": "object", "properties": {
-        "lookback_days": {"type": "integer", "default": 90},
-        "min_bookmarks": {"type": "integer", "default": 5},
-    }},
-}
-
 DIGEST_SCHEMA = {
     "name": "aeon_digest",
-    "description": "Synthesize a daily readout across discoveries, GitHub work, Oura health, and recent bookmarks. Returns {text, totals, window_hours}. The text is Telegram-markdown ready.",
+    "description": "Synthesize a daily readout from eligible general discoveries, GitHub work, and recent bookmarks. Returns {text, totals, window_hours}. The text is Telegram-markdown ready.",
     "parameters": {"type": "object", "properties": {
         "hours": {"type": "integer", "default": 24, "description": "Time window for the digest (default 24h)."},
     }},

@@ -1,10 +1,12 @@
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from adapter import FIELDS, SCOPE, Store, Invalid, Unavailable, serve
@@ -166,10 +168,30 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(reader.call('aeon_get',{'id':f'{1:032x}'})['item']);reader.db.close()
 
     def test_stale_view_fails_closed(self):
-        db=sqlite3.connect(self.path)
-        db.execute("UPDATE projection_metadata SET value=? WHERE key='published_at_ms'",(str(int(time.time()*1000)-901000),))
+        # Freshness ages a cached publication; editing a file may preserve its mtime.
+        with patch('time.time',return_value=(self.store.published_at+900001)/1000):
+            with self.assertRaises(Unavailable):self.store.call('aeon_recent',{})
+
+    def test_stale_atomic_replacement_fails_closed_with_same_mtime(self):
+        original=self.path.stat()
+        replacement=self.root/'stale-replacement.sqlite'
+        replacement.write_bytes(self.path.read_bytes())
+        db=sqlite3.connect(replacement)
+        db.execute("UPDATE projection_metadata SET value=? WHERE key='published_at_ms'",
+                   (str(self.store.published_at-901000),))
         db.commit();db.close()
-        with self.assertRaises(Unavailable):self.store.call('aeon_recent',{})
+        os.utime(replacement,ns=(original.st_atime_ns,original.st_mtime_ns))
+        replacement.replace(self.path)
+        with patch('time.time',return_value=self.store.published_at/1000):
+            with self.assertRaises(Unavailable):self.store.call('aeon_recent',{})
+
+    def test_projection_freshness_boundaries(self):
+        for age in [-60000,900000]:
+            with self.subTest(age=age),patch('time.time',return_value=(self.store.published_at+age)/1000):
+                self.assertEqual(self.store.call('aeon_recent',{})['count'],1)
+        for age in [-60001,900001]:
+            with self.subTest(age=age),patch('time.time',return_value=(self.store.published_at+age)/1000):
+                with self.assertRaises(Unavailable):self.store.call('aeon_recent',{})
 
     def test_failed_or_overlapping_publish_preserves_previous_view(self):
         import fcntl

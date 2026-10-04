@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
-from brain_service.policy import API_VERSION, HERMES, Principal, Denied, Invalid, Unavailable, general_envelope
+from brain_service.policy import API_VERSION, Principal, Denied, Invalid, Unavailable, general_envelope
 from brain_service.service import Service, now_ms
 from brain_service.gateway import Gateway
 from brain_service.migrate import migrate
