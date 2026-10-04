@@ -27,7 +27,7 @@ Imported evidence cannot be revised or retracted by general clients. Cross-agent
 corrections never overwrite another agent's assertion. Compatibility aliases
 `aeon_capture`, `aeon_get`, `aeon_search` and `aeon_recent` use the service shapes;
 `aeon_correct` maps the existing statement/summary/kind correction shape into a
-typed revision. This gateway is not installed behind the existing MCP adapter.
+typed revision. The MCP adapter offers an explicit `--general-socket` path; its legacy deployment remains unchanged. See [general-service-rollout.md](general-service-rollout.md).
 
 Request IDs are scoped to principal and payload. Identical retries return the
 original receipt even after a later revision; changed-payload reuse conflicts.
@@ -108,9 +108,8 @@ This PR runs migrations only on disposable synthetic fixtures.
 Before real deployment, separately decide principal bindings and least privilege,
 OS isolation, socket lifecycle, backup and rollback, legacy admission and trusted
 classification. Quotas/rate controls, cross-feed deduplication, asynchronous or
-semantic indexing, owner attestation and health access are deferred. No service
-unit, credential, production configuration or migration is supplied by this
-foundation. See [testing.md](testing.md) for verification and its limits.
+semantic indexing, owner attestation and health access are deferred. No service unit or credential is installed by this foundation. Proposed
+configuration and migration/rollback steps are in [general-service-rollout.md](general-service-rollout.md); applying them requires separate approval. See [testing.md](testing.md) for verification and its limits.
 
 ## Security remediation
 

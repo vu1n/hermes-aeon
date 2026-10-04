@@ -3,11 +3,14 @@
 import argparse
 import json
 import socket
+import sys
+from pathlib import Path
 
 if __package__:
     from .read_adapter import adapter as reader
 else:
     from read_adapter import adapter as reader
+    sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 
 READ_TOOLS = reader.tools
 
@@ -68,11 +71,69 @@ class Store(reader.Store):
         # Logical failures remain structured so callers can resolve revision conflicts.
         return value
 
+class GeneralStore:
+    """Explicit service mode: every operation is live; no snapshot or broker fallback."""
+    def __init__(self, socket_path):
+        from brain_service.client import Client
+        self.client=Client(socket_path)
+
+    def call(self,name,args):
+        from brain_service.policy import Unavailable as GeneralUnavailable, Invalid as GeneralInvalid
+        if name not in {definition['name'] for definition in general_tools()}:
+            raise reader.Invalid('Unknown tool')
+        try:return self.client.call(name,args)
+        except GeneralInvalid as error:raise reader.Invalid('Invalid general request') from error
+        except GeneralUnavailable as error:raise reader.Unavailable('General service unavailable') from error
+
+
+def general_tools():
+    """Existing note schemas plus neutral revision/proposal/lifecycle operations."""
+    definitions=tools()
+    for definition in definitions:
+        if definition['name'] in {'aeon_search','aeon_recent','aeon_get'}:
+            definition['description']='Read live eligible general memory with provenance; no snapshot fallback.'
+    identity={'request_id':{'type':'string','maxLength':120},
+              'memory_id':{'type':'string','pattern':'^[a-f0-9]{32}$'},
+              'expected_revision':{'type':'integer','minimum':1},
+              'reason':{'type':'string','minLength':1,'maxLength':512}}
+    patch={'type':'object','minProperties':1,'additionalProperties':False,'properties':{
+        'statement':{'type':'string','minLength':1,'maxLength':4000},
+        'summary':{'type':'string','maxLength':2000},'title':{'type':'string','maxLength':300},
+        'domain':{'type':'string','enum':sorted(reader.DOMAINS)},
+        'topics':{'type':'array','maxItems':32,'items':{'type':'string','maxLength':64}},
+        'project_id':{'type':'string','maxLength':128},
+        'applicability':{'type':'string','maxLength':256},
+        'expires_at':{'type':'integer','minimum':1}}}
+    for name,extra in [('revise',{'patch':patch}),('propose',{'statement':{'type':'string','minLength':1,'maxLength':4000}}),('retract',{}),('status',{}),('interests',{})]:
+        properties={} if name in {'status','interests'} else dict(identity,**extra)
+        if name=='propose':properties['reason']={'type':'string','minLength':1,'maxLength':256}
+        definitions.append({'name':name,'description':'General memory '+name+'. Identity is server-controlled; attribution is a client claim.',
+            'inputSchema':{'type':'object','properties':properties,'required':list(properties),'additionalProperties':False},
+            'annotations':{'readOnlyHint':name in {'status','interests'},'destructiveHint':name=='retract','idempotentHint':True,'openWorldHint':False}})
+    for definition in definitions:
+        properties=definition['inputSchema']['properties']
+        if definition['name']=='aeon_capture':
+            properties.update(topics={'type':'array','maxItems':32,'items':{'type':'string','maxLength':64}},
+                              record_class={'type':'string','enum':['assertion','working_context']},
+                              project_id={'type':'string','maxLength':128},
+                              expires_at={'type':'integer','minimum':1},
+                              applicability={'type':'string','maxLength':256})
+        prop=properties.get('request_id')
+        if prop:prop.update(pattern='^[A-Za-z0-9_.:-]{1,120}$',maxLength=120)
+    return definitions
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--db',required=True)
-    parser.add_argument('--broker-socket',required=True)
+    parser.add_argument('--db')
+    parser.add_argument('--broker-socket')
+    parser.add_argument('--general-socket',help='Opt in to live brain.general.v1; forbids projection/broker arguments')
     args=parser.parse_args()
-    reader.serve(Store(args.db,args.broker_socket), tool_definitions=tools)
+    if args.general_socket:
+        if args.db or args.broker_socket:parser.error('General mode cannot use a projection or legacy broker')
+        reader.serve(GeneralStore(args.general_socket),tool_definitions=general_tools)
+    else:
+        if not args.db or not args.broker_socket:parser.error('Legacy mode requires --db and --broker-socket')
+        reader.serve(Store(args.db,args.broker_socket), tool_definitions=tools)
 
 if __name__=='__main__': main()

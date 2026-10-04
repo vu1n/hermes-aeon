@@ -22,13 +22,16 @@ STATE_FIELDS=('owner_id','creator','current_revision','sensitivity','record_clas
 WRITE_FIELDS={'request_id','statement','title','summary','domain','topics','record_class','kind',
               'attribution_basis','conversation_ref','evidence_refs','project_id','expires_at','applicability'}
 PATCH_FIELDS={'statement','summary','title','domain','topics','project_id','expires_at','applicability','sensitivity','status','kind'}
+# Publication recomputes identity, revision and validity; adapters preserve these fields.
+METADATA_FIELDS=('sensitivity','record_class','kind','verification','topics','evidence_refs','applicability','expires_at')
 MAX_LINEAGE_WORK=4096
 
 
 class _WorkBudget:
-    def __init__(self):self.remaining=MAX_LINEAGE_WORK
+    def __init__(self) -> None:
+        self.remaining: int=MAX_LINEAGE_WORK
 
-    def spend(self):
+    def spend(self) -> None:
         if self.remaining<=0:raise Unavailable('Lineage work limit exceeded')
         self.remaining-=1
 
@@ -83,7 +86,7 @@ class Service:
     def _eligible(self,item,state,*,budget=None):
         budget=budget or _WorkBudget()
         records={item['id']:(item,state)} if item else {}
-        memo={}
+        memo: dict[tuple[str,int,int],bool]={}
 
         def visit(current,metadata,depth):
             budget.spend()
@@ -151,6 +154,7 @@ class Service:
         return result
 
     def _receipt(self,principal,operation,args):
+        """Hash the original API request so replay survives translated fields and changed inputs."""
         request=args.get('request_id')
         if not isinstance(request,str) or not re.fullmatch('[A-Za-z0-9_.:-]{1,120}',request):raise Invalid('Invalid request ID')
         try:serialized=json.dumps({'operation':operation,'arguments':args},sort_keys=True,allow_nan=False,separators=(',',':'))
@@ -258,7 +262,7 @@ class Service:
         if not old or not item or old['owner_id']!=self.owner_id or old['creator']!=principal.id or old['record_class']=='evidence':raise Denied('Item unavailable for revision')
         patch={'status':'retracted'} if retract else args.get('patch')
         if not isinstance(patch,dict) or not patch or set(patch)-PATCH_FIELDS:raise Invalid('Invalid patch')
-        metadata={k:old[k] for k in ['sensitivity','record_class','kind','verification','topics','evidence_refs','applicability','expires_at']}
+        metadata={k:old[k] for k in METADATA_FIELDS}
         if 'sensitivity' in patch:
             if patch['sensitivity'] not in {'general','restricted_health','unclassified'}:raise Invalid('Invalid sensitivity')
             if patch['sensitivity']=='general' and old['sensitivity']!='general':raise Denied('Declassification unavailable')

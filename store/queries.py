@@ -1,7 +1,6 @@
 """Typed query layer. JSON columns hydrated at the boundary — callers never see raw JSON."""
 from __future__ import annotations
 
-import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,9 +14,6 @@ else:
     from brain_service import hermes as general
 
 from .db import AeonDB
-
-logger = logging.getLogger(__name__)
-
 
 VALID_DOMAINS = {"inbox", "work", "side_projects", "learning", "health", "life_admin", "people_comms"}
 VALID_TYPES = {"note", "link", "email", "thread", "task", "health_log", "file", "calendar_event", "contact", "other"}
