@@ -120,6 +120,15 @@ def general_tools():
                               applicability={'type':'string','maxLength':256})
         prop=properties.get('request_id')
         if prop:prop.update(pattern='^[A-Za-z0-9_.:-]{1,120}$',maxLength=120)
+    source_refs={'type':'array','minItems':1,'maxItems':16,'items':{'type':'object','additionalProperties':False,
+        'properties':{'memory_id':{'type':'string','pattern':'^[a-f0-9]{32}$'},'revision':{'type':'integer','minimum':1}},
+        'required':['memory_id','revision']}}
+    for name in ['consolidate_preview','consolidate_stage']:
+        properties={'source_refs':source_refs}
+        if name=='consolidate_stage':properties['expected_candidate_id']={'type':'string','pattern':'^[a-f0-9]{64}$'}
+        definitions.append({'name':name,'description':'Preview or stage a source-linked candidate for owner review. Never applies corrections or promotes preferences.',
+            'inputSchema':{'type':'object','properties':properties,'required':list(properties),'additionalProperties':False},
+            'annotations':{'readOnlyHint':name=='consolidate_preview','destructiveHint':False,'idempotentHint':True,'openWorldHint':False}})
     return definitions
 
 

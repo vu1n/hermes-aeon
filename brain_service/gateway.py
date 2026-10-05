@@ -39,6 +39,10 @@ class Gateway:
             if operation in {'capture','revise','propose','retract'}:
                 if operation=='retract':result=self.service.revise(principal,args,retract=True)
                 else:result=getattr(self.service,operation)(principal,args)
+            elif operation in {'consolidate_preview','consolidate_stage'}:
+                from .consolidation import Consolidation
+                loop=Consolidation(self.service)
+                result=loop.preview(principal,args) if operation=='consolidate_preview' else loop.stage(principal,args)
             elif operation=='get':
                 if set(args)!={'id'}:raise Invalid('Invalid get arguments')
                 result={'item':self.service.get(principal,args['id'])}
