@@ -72,6 +72,17 @@ class ConsolidationTests(unittest.TestCase):
         self.assertEqual(self.service.get(A,a['memory_id'])['revision'],1)
         self.assertEqual(candidate['claims'][1]['sources'][0]['support'],'client_claim')
 
+    def test_unrelated_revision_invalidates_and_restaging_does_not_revive(self):
+        source=self.capture();preview=self.preview(source);receipt=self.stage(preview,source)
+        unrelated=self.capture(B,statement='Fresh unrelated compiler note')
+        self.assertIsNotNone(self.service.get(A,receipt['memory_id']))
+        self.service.revise(B,dict(request_id='unrelated-revision',memory_id=unrelated['memory_id'],expected_revision=1,
+            reason='Unrelated update',patch={'statement':'Revised unrelated compiler note'}))
+        self.assertIsNone(self.service.get(A,receipt['memory_id']))
+        self.assertEqual(self.stage(preview,source),receipt)
+        self.assertIsNone(self.service.get(A,receipt['memory_id']))
+        self.assertEqual(self.service.get(A,source['memory_id'])['revision'],1)
+
     def test_support_and_supersedes_edges_survive_export(self):
         original=self.capture(record_class='evidence')
         claim=self.capture(B,statement='Supported compiler assertion',evidence_refs=[dict(original,relationship='supports')])

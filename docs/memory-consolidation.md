@@ -50,7 +50,12 @@ between preview and capture prevents publication. An identical retry returns the
 original durable receipt; always `get` its ID before presenting it, since receipts
 are historical and source changes can invalidate the view. Existing broad derived
 invalidation remains conservative: unrelated general revisions can invalidate a
-candidate too. All reads/search and generated exports pass live general policy;
+candidate too. A fresh capture alone does not invalidate existing candidates;
+a revision to an unrelated existing general record does. Identically restaging
+an invalidated candidate returns its old idempotent receipt and does not revive
+its live eligibility. This baseline requires manual/operator invocation and
+provides no regeneration or durable review queue. Do not report an old receipt as
+a fresh live candidate; check `get` first. All reads/search and generated exports pass live general policy;
 there is no raw-record export or private-data fallback.
 
 One invocation covers one domain, at most 16 selected/expanded unique sources,
