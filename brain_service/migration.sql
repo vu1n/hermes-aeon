@@ -43,3 +43,7 @@ CREATE TABLE IF NOT EXISTS brain_review_decisions (
  reason_code TEXT NOT NULL, expected_revision INTEGER NOT NULL, created_at INTEGER NOT NULL,
  UNIQUE(reviewer,request_id)
 );
+
+-- Queue pagination and duplicate flags must not sort the whole pending corpus.
+CREATE INDEX IF NOT EXISTS brain_review_order ON brain_review_attempts(created_at,attempt_id);
+CREATE INDEX IF NOT EXISTS brain_review_peers ON brain_review_attempts(creator,candidate_id,parent_attempt,created_at,attempt_id);

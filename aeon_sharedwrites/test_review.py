@@ -2,6 +2,7 @@
 import concurrent.futures
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from brain_service.policy import Principal, Denied, Invalid, Unavailable
@@ -38,7 +39,9 @@ class ReviewTests(unittest.TestCase):
     def test_atomic_stage_replay_pending_accept_history_and_no_promotion(self):
         args=self.args();attempt=self.reviews.stage(AUTHOR,args)
         self.assertEqual(attempt,self.reviews.stage(AUTHOR,args))
-        self.assertEqual(self.reviews.pending(REVIEWER,{})['items'],[dict(attempt_id=attempt['attempt_id'],live_eligible=True)])
+        entry=self.reviews.pending(REVIEWER,{})['items'][0]
+        self.assertEqual(entry['attempt_id'],attempt['attempt_id']);self.assertTrue(entry['live_eligible'])
+        self.assertEqual(entry['candidate_ref'],dict(memory_id=attempt['memory_id'],revision=1))
         decision=self.decide(attempt);self.assertEqual(decision,self.decide(attempt))
         self.assertEqual(self.reviews.pending(REVIEWER,{})['items'],[])
         history=self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})
@@ -71,7 +74,7 @@ class ReviewTests(unittest.TestCase):
 
     def test_rejection_retains_reason_but_does_not_mean_semantic_false(self):
         attempt=self.stage();self.update(self.source['memory_id'])
-        self.reviews.decide(REVIEWER,dict(request_id='reject',attempt_id=attempt['attempt_id'],expected_revision=1,decision='rejected',reason_code='outdated'))
+        self.reviews.decide(REVIEWER,dict(request_id='reject',attempt_id=attempt['attempt_id'],decision='rejected',reason_code='outdated'))
         history=self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})
         self.assertEqual(history['decision']['reason_code'],'outdated')
         self.assertNotIn('content',str(history));self.assertNotIn('source_refs',history)
@@ -151,6 +154,126 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(page['items']),1);self.assertIsNotNone(page['next_after'])
         self.assertEqual(len(self.reviews.pending(REVIEWER,{'limit':1,'after':page['next_after']})['items']),1)
         with self.assertRaises(Invalid):self.reviews.pending(REVIEWER,{'limit':51})
+
+    def test_second_client_can_fetch_and_decide_from_queue_only(self):
+        self.stage()
+        db=sqlite3.connect(self.path,isolation_level=None)
+        try:
+            service=Service(db);reviews=Reviews(service)
+            queued=reviews.pending(REVIEWER,{})['items'][0]
+            ref=queued['candidate_ref']
+            candidate=service.get(REVIEWER,ref['memory_id'])
+            self.assertEqual(candidate['revision'],ref['revision'])
+            reviews.decide(REVIEWER,dict(request_id='second-client',attempt_id=queued['attempt_id'],
+                expected_revision=ref['revision'],decision='accepted',reason_code='faithful'))
+            history=reviews.history(REVIEWER,{'attempt_id':queued['attempt_id']})
+            self.assertEqual(history['candidate_ref'],ref);self.assertEqual(history['state'],'accepted')
+        finally:db.close()
+
+    def test_unavailable_closure_hides_ref_and_never_bypasses_live_cas(self):
+        attempt=self.stage()
+        close=dict(request_id='close',attempt_id=attempt['attempt_id'],decision='rejected',reason_code='outdated')
+        with self.assertRaises(Denied):self.reviews.decide(REVIEWER,close)
+        with self.assertRaises(Invalid):self.reviews.decide(REVIEWER,dict(close,decision='accepted'))
+        self.service.revise(AUTHOR,dict(request_id='restricted-candidate',memory_id=attempt['memory_id'],expected_revision=1,
+            reason='Synthetic restriction',patch={'sensitivity':'restricted_health'}))
+        self.assertIsNone(self.reviews.pending(REVIEWER,{})['items'][0]['candidate_ref'])
+        history=self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})
+        self.assertIsNone(history['candidate_ref']);self.assertNotIn(attempt['memory_id'],str(history))
+        self.assertEqual(self.reviews.decide(REVIEWER,close),self.reviews.decide(REVIEWER,close))
+        self.assertEqual(self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})['decision']['expected_revision'],0)
+        with self.assertRaises(Conflict):self.reviews.decide(REVIEWER,dict(close,request_id='competing'))
+        self.assertEqual(self.reviews.pending(REVIEWER,{})['items'],[])
+
+    def test_retracted_and_missing_candidate_can_be_closed_without_revision(self):
+        attempt=self.stage()
+        self.service.revise(AUTHOR,dict(request_id='retract-candidate',memory_id=attempt['memory_id'],expected_revision=1,reason='Synthetic withdrawal'),retract=True)
+        self.reviews.decide(REVIEWER,dict(request_id='close-retracted',attempt_id=attempt['attempt_id'],decision='rejected',reason_code='outdated'))
+        second=self.stage('missing')
+        # Synthetic corruption/removal: preserve the attempt to exercise unavailable closure.
+        self.db.execute('DELETE FROM memory_items WHERE id=?',(second['memory_id'],))
+        self.reviews.decide(REVIEWER,dict(request_id='close-missing',attempt_id=second['attempt_id'],decision='rejected',reason_code='outdated'))
+
+    def test_oldest_first_ties_duplicates_and_cursor_survive_decisions(self):
+        attempts=[self.stage('ordered-'+str(i)) for i in range(3)]
+        ordered=sorted(attempts,key=lambda a:a['attempt_id'],reverse=True)
+        for index,attempt in enumerate(ordered):
+            self.db.execute('UPDATE brain_review_attempts SET created_at=? WHERE attempt_id=?',(100+index,attempt['attempt_id']))
+        page=self.reviews.pending(REVIEWER,{'limit':1});first=page['items'][0]
+        self.assertEqual(first['attempt_id'],ordered[0]['attempt_id'])
+        self.assertTrue(first['has_duplicates'])
+        self.assertTrue(all(row['duplicate_group']==first['attempt_id'] for row in self.reviews.pending(REVIEWER,{})['items']))
+        self.decide(ordered[0])
+        rest=self.reviews.pending(REVIEWER,{'after':page['next_after']})['items']
+        self.assertEqual([x['attempt_id'] for x in rest],[a['attempt_id'] for a in ordered[1:]])
+        self.assertTrue(all(x['has_duplicates'] for x in rest))
+        self.db.execute('UPDATE brain_review_attempts SET created_at=200')
+        tied=self.reviews.pending(REVIEWER,{'limit':1})
+        following=self.reviews.pending(REVIEWER,{'after':tied['next_after']})
+        self.assertLess(tied['items'][0]['attempt_id'],following['items'][0]['attempt_id'])
+        for cursor in ['bad','-1:'+ordered[0]['attempt_id'],'9'*20+':'+ordered[0]['attempt_id']]:
+            with self.assertRaises(Invalid):self.reviews.pending(REVIEWER,{'after':cursor})
+
+    def test_queue_revision_is_live_and_acceptance_rechecks_source_change(self):
+        attempt=self.stage();ref=self.reviews.pending(REVIEWER,{})['items'][0]['candidate_ref']
+        self.service.revise(AUTHOR,dict(request_id='candidate-title',memory_id=ref['memory_id'],expected_revision=1,
+            reason='Synthetic edit',patch={'title':'Edited title'}))
+        with self.assertRaises(Conflict):self.decide(attempt)
+        current=self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})['candidate_ref']
+        self.assertEqual(current['revision'],2)
+        self.update(self.source['memory_id'])
+        with self.assertRaises(Denied):self.reviews.decide(REVIEWER,dict(request_id='after-source-change',attempt_id=attempt['attempt_id'],expected_revision=2,decision='accepted',reason_code='faithful'))
+        self.assertIsNone(self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})['candidate_ref'])
+        self.reviews.decide(REVIEWER,dict(request_id='close-after-edit',attempt_id=attempt['attempt_id'],decision='rejected',reason_code='outdated'))
+
+    def test_unavailable_closure_rechecks_eligibility_and_hides_revision_conflict(self):
+        attempt=self.stage()
+        unrelated=self.service.capture(AUTHOR,dict(request_id='unrelated',domain='work',statement='Synthetic unrelated note'))
+        self.update(unrelated['memory_id'])
+        self.assertIsNone(self.reviews.pending(REVIEWER,{})['items'][0]['candidate_ref'])
+        # Synthetic restored validity represents an eligibility change after queue retrieval.
+        self.db.execute('UPDATE brain_records SET valid=1 WHERE memory_id=?',(attempt['memory_id'],))
+        close=dict(request_id='close-restored',attempt_id=attempt['attempt_id'],decision='rejected',reason_code='outdated')
+        with self.assertRaises(Denied):self.reviews.decide(REVIEWER,close)
+        self.assertEqual(self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})['state'],'pending')
+        self.service.revise(AUTHOR,dict(request_id='hide-revision',memory_id=attempt['memory_id'],expected_revision=1,
+            reason='Synthetic restriction',patch={'sensitivity':'restricted_health'}))
+        with self.assertRaises(Denied):self.reviews.decide(REVIEWER,dict(close,expected_revision=1))
+        with self.assertRaises(Denied):self.reviews.decide(REVIEWER,dict(close,expected_revision=2))
+        self.reviews.decide(REVIEWER,close)
+
+    def test_concurrent_invalid_closure_has_one_winner(self):
+        attempt=self.stage();self.update(self.source['memory_id'])
+        def close(index):
+            db=sqlite3.connect(self.path,isolation_level=None,timeout=1)
+            try:
+                return Reviews(Service(db)).decide(REVIEWER,dict(request_id='close-'+str(index),attempt_id=attempt['attempt_id'],
+                    decision='rejected',reason_code='outdated'))
+            except Conflict:return None
+            finally:db.close()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:results=list(pool.map(close,range(4)))
+        self.assertEqual(sum(result is not None for result in results),1)
+
+    def test_source_change_racing_decision_preserves_history_and_live_policy(self):
+        attempt=self.stage();barrier=threading.Barrier(2)
+        def run(change):
+            db=sqlite3.connect(self.path,isolation_level=None,timeout=2)
+            try:
+                service=Service(db);barrier.wait(timeout=2)
+                if change:
+                    return service.revise(AUTHOR,dict(request_id='racing-source-edit',memory_id=self.source['memory_id'],
+                        expected_revision=1,reason='Synthetic racing edit',patch={'statement':'Changed compiler claim'}))
+                try:return Reviews(service).decide(REVIEWER,dict(request_id='racing-accept',attempt_id=attempt['attempt_id'],
+                    expected_revision=1,decision='accepted',reason_code='faithful'))
+                except Denied:return None
+            finally:db.close()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(run,[False,True]))
+        history=self.reviews.history(REVIEWER,{'attempt_id':attempt['attempt_id']})
+        self.assertEqual(history['state'],'accepted' if results[0] else 'pending')
+        self.assertIsNone(history['candidate_ref']);self.assertFalse(history['live_eligible'])
+        if results[0] is None:
+            with self.assertRaises(Denied):self.reviews.decide(REVIEWER,dict(request_id='late-accept',attempt_id=attempt['attempt_id'],
+                expected_revision=1,decision='accepted',reason_code='faithful'))
 
     def test_review_requires_explicit_migration(self):
         self.db.execute('DROP TABLE brain_review_decisions');self.db.execute('DROP TABLE brain_review_attempts')

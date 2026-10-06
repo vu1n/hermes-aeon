@@ -67,6 +67,32 @@ class GeneralTransport(unittest.TestCase):
         self.assertIsNone(neutral('get',{'id':restricted['result']['memory_id']})['result']['item'])
         self.assertFalse(neutral('capture',dict(self.args(),domain='health'))['ok'])
 
+    def test_review_two_clients_queue_fetch_decide_and_close_unavailable(self):
+        author=Principal('planner','local',CAPS|{'derive'},'chat:planner')
+        reviewer=Principal('reviewer','local',frozenset({'read','review'}),'review:owner')
+        gateway=Gateway(self.db,principals={'planner':author,'reviewer':reviewer},peer_bindings={101:'planner',102:'reviewer'})
+        def call(uid,op,args):
+            response=gateway.handle_peer(uid,dict(api_version='brain.general.v1',operation=op,arguments=args))
+            self.assertTrue(response['ok'],response)
+            return response['result']
+        source=call(101,'capture',self.args())
+        refs=[dict(memory_id=source['memory_id'],revision=1)]
+        preview=call(101,'consolidate_preview',{'source_refs':refs})
+        call(101,'review_stage',dict(request_id='queue',source_refs=refs,expected_candidate_id=preview['candidate_id']))
+        entry=call(102,'review_pending',{})['items'][0]
+        ref=entry['candidate_ref'];item=call(102,'get',{'id':ref['memory_id']})['item']
+        self.assertEqual(item['revision'],ref['revision'])
+        call(102,'review_decide',dict(request_id='accept',attempt_id=entry['attempt_id'],expected_revision=ref['revision'],decision='accepted',reason_code='faithful'))
+        call(101,'review_stage',dict(request_id='queue2',source_refs=refs,expected_candidate_id=preview['candidate_id']))
+        call(101,'retract',dict(request_id='withdraw-source',memory_id=source['memory_id'],expected_revision=1,reason='Synthetic withdrawal'))
+        unavailable=call(102,'review_pending',{})['items'][0]
+        self.assertIsNone(unavailable['candidate_ref'])
+        call(102,'review_decide',dict(request_id='close',attempt_id=unavailable['attempt_id'],decision='rejected',reason_code='outdated'))
+        self.assertEqual(call(102,'review_pending',{})['items'],[])
+        self.assertEqual(call(102,'review_history',{'attempt_id':unavailable['attempt_id']})['decision']['expected_revision'],0)
+        schemas={tool['name']:tool['inputSchema'] for tool in general_tools()}
+        self.assertNotIn('expected_revision',schemas['review_decide']['required'])
+
     def test_mcp_logical_errors_and_advertised_operations(self):
         requests=[dict(jsonrpc='2.0',id=1,method='initialize'),dict(jsonrpc='2.0',id=2,method='tools/call',params={'name':'aeon_capture','arguments':dict(self.args(),domain='health')})]
         output=io.StringIO()
