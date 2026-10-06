@@ -72,7 +72,7 @@ class GeneralTransport(unittest.TestCase):
         output=io.StringIO()
         reader.serve(self.store,io.BytesIO(('\n'.join(json.dumps(r) for r in requests)+'\n').encode()),output,tool_definitions=general_tools)
         self.assertTrue(json.loads(output.getvalue().splitlines()[1])['result']['isError'])
-        self.assertEqual({t['name'] for t in general_tools()},{'aeon_capture','aeon_correct','aeon_get','aeon_search','aeon_recent','revise','propose','retract','status','interests'})
+        self.assertEqual({t['name'] for t in general_tools()},{'aeon_capture','aeon_correct','aeon_get','aeon_search','aeon_recent','revise','propose','retract','status','interests','consolidate_preview','consolidate_stage'})
 
     def test_client_fail_closed_and_bounded(self):
         with self.assertRaises(Unavailable):Client('/missing-synthetic.sock').call('recent',{})
@@ -124,6 +124,12 @@ class GeneralTransport(unittest.TestCase):
                 self.assertFalse(stale['ok'])
                 self.assertEqual(client.call('revise',revision),revised)
 
+                source_refs=[dict(memory_id=mid,revision=2)]
+                preview=client.call('consolidate_preview',{'source_refs':source_refs})
+                self.assertTrue(preview['ok'],preview)
+                # Existing neutral principal has no derive capability: preview is read-only.
+                stage=client.call('consolidate_stage',dict(source_refs=source_refs,expected_candidate_id=preview['result']['candidate_id']))
+                self.assertEqual(stage['error']['code'],'not_found_or_denied')
                 self.assertEqual(os.stat(endpoint).st_mode&0o777,0o600)
                 with self.assertRaises(OSError):Server(endpoint,self.path,self.principals,{os.getuid():'researcher'})
                 # A durable large record must never emit a partial/oversized wire result.
