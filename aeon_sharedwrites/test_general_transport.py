@@ -72,7 +72,7 @@ class GeneralTransport(unittest.TestCase):
         output=io.StringIO()
         reader.serve(self.store,io.BytesIO(('\n'.join(json.dumps(r) for r in requests)+'\n').encode()),output,tool_definitions=general_tools)
         self.assertTrue(json.loads(output.getvalue().splitlines()[1])['result']['isError'])
-        self.assertEqual({t['name'] for t in general_tools()},{'aeon_capture','aeon_correct','aeon_get','aeon_search','aeon_recent','revise','propose','retract','status','interests','consolidate_preview','consolidate_stage'})
+        self.assertEqual({t['name'] for t in general_tools()},{'aeon_capture','aeon_correct','aeon_get','aeon_search','aeon_recent','revise','propose','retract','status','interests','consolidate_preview','consolidate_stage','review_stage','review_pending','review_history','review_decide'})
 
     def test_client_fail_closed_and_bounded(self):
         with self.assertRaises(Unavailable):Client('/missing-synthetic.sock').call('recent',{})

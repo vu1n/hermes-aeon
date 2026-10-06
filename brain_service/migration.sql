@@ -30,3 +30,16 @@ CREATE TABLE IF NOT EXISTS brain_requests (
  principal TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL,
  result_json TEXT NOT NULL, PRIMARY KEY(principal,request_id)
 );
+
+CREATE TABLE IF NOT EXISTS brain_review_attempts (
+ attempt_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL REFERENCES memory_items(id),
+ parent_attempt TEXT REFERENCES brain_review_attempts(attempt_id), creator TEXT NOT NULL,
+ candidate_id TEXT NOT NULL, pins_json TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS brain_review_decisions (
+ attempt_id TEXT PRIMARY KEY REFERENCES brain_review_attempts(attempt_id),
+ reviewer TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL,
+ decision TEXT NOT NULL CHECK(decision IN ('accepted','rejected')),
+ reason_code TEXT NOT NULL, expected_revision INTEGER NOT NULL, created_at INTEGER NOT NULL,
+ UNIQUE(reviewer,request_id)
+);

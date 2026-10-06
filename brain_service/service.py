@@ -45,6 +45,11 @@ def identifier(value):
     if not isinstance(value,str) or not re.fullmatch('[a-f0-9]{32}',value):raise Invalid('Invalid memory ID')
     return value
 
+def request_identifier(value):
+    if not isinstance(value,str) or not re.fullmatch('[A-Za-z0-9_.:-]{1,120}',value):raise Invalid('Invalid request ID')
+    return value
+
+
 def bounded_text(value,maximum,optional=True):
     if value is None and optional:return None
     if not isinstance(value,str) or len(value)>maximum:raise Invalid('Invalid text')
@@ -155,8 +160,7 @@ class Service:
 
     def _receipt(self,principal,operation,args):
         """Hash the original API request so replay survives translated fields and changed inputs."""
-        request=args.get('request_id')
-        if not isinstance(request,str) or not re.fullmatch('[A-Za-z0-9_.:-]{1,120}',request):raise Invalid('Invalid request ID')
+        request=request_identifier(args.get('request_id'))
         try:serialized=json.dumps({'operation':operation,'arguments':args},sort_keys=True,allow_nan=False,separators=(',',':'))
         except (ValueError,TypeError,RecursionError):raise Invalid('Invalid request') from None
         if len(serialized)>150000:raise Invalid('Request exceeds limit')
@@ -167,7 +171,7 @@ class Service:
             return request,digest,json.loads(previous[1])
         return request,digest,None
 
-    def _hook(self,principal,metadata,reason,request=None,digest=None,*,budget=None):
+    def _hook(self,principal,metadata,reason,request=None,digest=None,*,budget=None,publication_hook=None):
         budget=budget or _WorkBudget()
         def persist(result,now):
             mid,revision=result['memory_id'],result['revision']
@@ -211,11 +215,13 @@ class Service:
                 self.db.execute('INSERT INTO brain_general_changes(memory_id,revision_n,operation) VALUES(?,?,?)',(mid,revision,'capture' if revision==1 else 'revise'))
                 sequence=self.db.execute('SELECT max(sequence) FROM brain_general_changes').fetchone()[0]
             result.update(commit_sequence=sequence,durability='committed',search_visibility='visible' if indexed else 'ineligible')
+            # Extensions and their receipt fields share this transaction and roll back together.
+            if publication_hook is not None:publication_hook(result,now)
             if request is not None:
                 self.db.execute('INSERT INTO brain_requests VALUES(?,?,?,?)',(principal.id,request,digest,json.dumps(result,sort_keys=True)))
         return persist
 
-    def capture(self,principal,args,*,receipt_operation="capture",receipt_args=None,budget=None):
+    def capture(self,principal,args,*,receipt_operation="capture",receipt_args=None,budget=None,publication_hook=None):
         self._authorize(principal,'capture')
         if not isinstance(args,dict) or set(args)-WRITE_FIELDS:raise Invalid('Unexpected capture fields')
         request,digest,previous=self._receipt(principal,receipt_operation,receipt_args if receipt_args is not None else args)
@@ -246,7 +252,7 @@ class Service:
             content=statement,title=bounded_text(args.get('title'),300),summary=bounded_text(args.get('summary'),2000),
             source=principal.source_namespace,project_id=bounded_text(args.get('project_id'),128),tags=metadata['topics'],
             entry_kind=kind,attribution_basis=basis,conversation_ref=bounded_text(args.get('conversation_ref'),128),
-            extra_payload=args,revision_hook=self._hook(principal,metadata,'capture',request,digest,budget=budget))
+            extra_payload=args,revision_hook=self._hook(principal,metadata,'capture',request,digest,budget=budget,publication_hook=publication_hook))
 
     def revise(self,principal,args,*,retract=False):
         self._authorize(principal,'retract_own' if retract else 'revise_own')

@@ -90,9 +90,13 @@ class Consolidation:
         self.service._authorize(principal,'derive')
         preview=self.preview(principal,dict(source_refs=args['source_refs']))
         if args['expected_candidate_id']!=preview['candidate_id']:raise Denied('Candidate changed')
+        return self.capture_candidate(principal,preview,'consolidate:'+preview['candidate_id'])
+
+    def capture_candidate(self,principal,preview,request_id,*,publication_hook=None,receipt_args=None):
         candidate=preview['candidate']
-        return self.service.capture(principal,dict(request_id='consolidate:'+preview['candidate_id'],
+        return self.service.capture(principal,dict(request_id=request_id,
             statement=encoded(candidate),title='Consolidation candidate: owner review required',
             domain=candidate['domain'],topics=candidate['topics'],record_class='derived_view',kind='idea',
             attribution_basis='assistant_inferred',applicability='Pending owner review; source applicability is retained per claim.',
-            evidence_refs=candidate['source_refs']))
+            evidence_refs=candidate['source_refs']),publication_hook=publication_hook,
+            receipt_operation='capture' if receipt_args is None else 'review_stage',receipt_args=receipt_args)

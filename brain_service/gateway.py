@@ -43,6 +43,9 @@ class Gateway:
                 from .consolidation import Consolidation
                 loop=Consolidation(self.service)
                 result=loop.preview(principal,args) if operation=='consolidate_preview' else loop.stage(principal,args)
+            elif operation in {'review_stage','review_pending','review_history','review_decide'}:
+                from .review import Reviews
+                result=getattr(Reviews(self.service),operation.removeprefix('review_'))(principal,args)
             elif operation=='get':
                 if set(args)!={'id'}:raise Invalid('Invalid get arguments')
                 result={'item':self.service.get(principal,args['id'])}
