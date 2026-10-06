@@ -12,7 +12,7 @@ from .policy import Principal, Invalid
 from .service import available
 from .client import MAX_FRAME
 
-CAPABILITIES=frozenset({'read','capture','revise_own','retract_own','propose','import','derive'})
+CAPABILITIES=frozenset({'read','capture','revise_own','retract_own','propose','import','derive','review'})
 
 def bindings(path):
     config=json.loads(Path(path).read_text())

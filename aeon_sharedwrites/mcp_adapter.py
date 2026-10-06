@@ -126,9 +126,22 @@ def general_tools():
     for name in ['consolidate_preview','consolidate_stage']:
         properties={'source_refs':source_refs}
         if name=='consolidate_stage':properties['expected_candidate_id']={'type':'string','pattern':'^[a-f0-9]{64}$'}
-        definitions.append({'name':name,'description':'Preview or stage a source-linked candidate for owner review. Never applies corrections or promotes preferences.',
+        definitions.append({'name':name,'description':'Preview a source-linked candidate, or use legacy consolidate_stage for an unqueued durable receipt. Use review_stage for the review queue; legacy replay never regenerates an invalidated candidate.',
             'inputSchema':{'type':'object','properties':properties,'required':list(properties),'additionalProperties':False},
             'annotations':{'readOnlyHint':name=='consolidate_preview','destructiveHint':False,'idempotentHint':True,'openWorldHint':False}})
+    aid={'type':'string','pattern':'^[a-f0-9]{32}$'}
+    review_schemas={
+        'review_stage':dict(request_id={'type':'string','maxLength':120},source_refs=source_refs,
+            expected_candidate_id={'type':'string','pattern':'^[a-f0-9]{64}$'},parent_attempt=aid),
+        'review_pending':dict(limit={'type':'integer','minimum':1,'maximum':50},after={'type':'string','maxLength':52,'pattern':'^[0-9]{1,19}:[a-f0-9]{32}$'}),
+        'review_history':dict(attempt_id=aid),
+        'review_decide':dict(request_id={'type':'string','maxLength':120},attempt_id=aid,expected_revision={'type':'integer','minimum':1},
+            decision={'type':'string','enum':['accepted','rejected']},reason_code={'type':'string','enum':['faithful','conflict','outdated','duplicate','irrelevant']})}
+    for name,properties in review_schemas.items():
+        required=[] if name=='review_pending' else [key for key in properties if key not in {'parent_attempt','expected_revision'}]
+        definitions.append({'name':name,'description':'Durable review metadata. Acceptance and eligible rejection require expected_revision; omit it only to reject an unavailable attempt. Decisions never promote preferences or apply corrections.',
+            'inputSchema':{'type':'object','properties':properties,'required':required,'additionalProperties':False},
+            'annotations':{'readOnlyHint':name in {'review_pending','review_history'},'destructiveHint':False,'idempotentHint':True,'openWorldHint':False}})
     return definitions
 
 

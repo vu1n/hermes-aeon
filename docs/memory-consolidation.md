@@ -102,3 +102,7 @@ owned staged candidates through the existing API; raw sources remain intact.
 Revoking/reconfiguring access or restoring a backup requires separate approval.
 See [general-service-rollout.md](general-service-rollout.md) for unchanged socket,
 backup, migration and filesystem boundaries.
+
+For explicit durable attempts, metadata-only pending/decision history and fresh
+linked regeneration, see [consolidation-review.md](consolidation-review.md). The
+original consolidation operations above keep their receipt semantics unchanged.
