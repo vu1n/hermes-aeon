@@ -34,10 +34,13 @@ Output strict JSON: {"score": <float 0..1>, "reason": "<one short sentence>"}
 
 def _derive_topics(profile: str, max_topics: int) -> list[str]:
     try:
+        # gemini-2.5-flash is a thinking model: thoughtsTokenCount draws
+        # from maxOutputTokens, so small caps truncate the visible JSON
+        # (observed: 382 thought tokens + 4 answer tokens at cap=400).
         data = llm_json(
-            f"Interest profile:\n{profile}\n\nExtract X search topics now.",
-            system=TOPIC_SYSTEM, max_tokens=400, temperature=0.2,
-        )
+                f"Interest profile:\n{profile}\n\nExtract X search topics now.",
+                system=TOPIC_SYSTEM, max_tokens=2048, temperature=0.2,
+            )
         topics = data.get("topics") or []
         return [str(t).strip() for t in topics if str(t).strip()][:max_topics]
     except Exception as e:
@@ -50,13 +53,15 @@ def _search(query: str, limit: int, min_likes: int, min_retweets: int, key: str)
         f"{TWITTERAPI_BASE}/twitter/tweet/advanced_search",
         headers={"x-api-key": key},
         params={
-            "query": f"{query} min_faves:{min_likes} min_retweets:{min_retweets} -filter:replies",
+            "query": f"{query} min_faves:{min_likes} min_retweets:{min_retweets}",
             "queryType": "Top",
         },
         timeout=30.0,
     )
     resp.raise_for_status()
-    return (resp.json().get("tweets") or [])[:limit]
+    tweets = resp.json().get("tweets") or []
+    # Filter out replies in Python (twitterapi.io doesn't support -filter:replies)
+    return [t for t in tweets if not t.get("inReplyToId")][:limit]
 
 
 def _score(profile: str, tweet: dict) -> tuple[float, str]:
@@ -64,7 +69,8 @@ def _score(profile: str, tweet: dict) -> tuple[float, str]:
     author = (tweet.get("author") or {}).get("userName", "?")
     prompt = (f"Interest profile:\n{profile}\n\nTweet (@{author}):\n{text}\n\nScore it now.")
     try:
-        data = llm_json(prompt, system=SCORE_SYSTEM, max_tokens=200, temperature=0.1)
+        # thinking model: needs headroom for reasoning tokens (see _derive_topics)
+        data = llm_json(prompt, system=SCORE_SYSTEM, max_tokens=1024, temperature=0.1)
         return float(data.get("score", 0.0)), str(data.get("reason", ""))[:200]
     except Exception as e:
         log.debug("score failed for tweet %s: %s", tweet.get("id"), e)

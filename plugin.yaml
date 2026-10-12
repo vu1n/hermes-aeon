@@ -10,6 +10,11 @@ kind: standalone
 hooks:
   - on_session_end
   - pre_llm_call
+# libsql-experimental removed 2026-10-06: uv built it from sdist for the bundled
+# Python 3.14.7 runtime (no cp314 wheel exists upstream) and that binary segfaults
+# in PyNumber_Index on FTS MATCH / fetchall — killed every aeon cron worker and
+# crashed the gateway. store/db.py falls back to stdlib sqlite3 (FTS5 hybrid search
+# works; vector_distance_cos ranking is a no-op). Re-add only when upstream ships a
+# working cp314/abi3 wheel.
 pip_dependencies:
-  - libsql-experimental
   - httpx

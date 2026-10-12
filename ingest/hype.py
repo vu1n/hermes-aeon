@@ -17,9 +17,12 @@ from ._common import llm_json, get_profile_text
 log = logging.getLogger("aeon.ingest.hype")
 
 ITEM_RE = re.compile(
-    r'<a\s+href="([^"]+)"\s+target="_blank"[^>]*>([^<]+)</a>'
+    r'<li[^>]*>\s*<span[^>]*>\d+\.</span>\s*<div[^>]*>'
+    r'\s*<div[^>]*>'
+    r'\s*<a\s+href="([^"]+)"[^>]*>([^<]+)</a>'
     r'\s*<span[^>]*>([⭐👽🤗®])\s*(\d+)</span>'
-    r'\s*</div>\s*<p[^>]*>([^<]*)</p>',
+    r'\s*</div>'
+    r'\s*<p[^>]*>(.*?)</p>',
     re.DOTALL,
 )
 
@@ -72,7 +75,7 @@ def run(db) -> dict:
 
     url = os.environ.get(
         "HYPE_URL",
-        "https://hype.replicate.dev/?filter=past_day&sources=GitHub,HuggingFace,Reddit,Replicate",
+        "https://hype.replicate.dev/?filter=past_week&sources=GitHub,HuggingFace,Reddit,Replicate",
     )
     threshold = float(os.environ.get("HYPE_SCORE_THRESHOLD", "0.6"))
     max_items = int(os.environ.get("HYPE_MAX_ITEMS", "60"))

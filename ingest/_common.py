@@ -33,6 +33,14 @@ def llm_chat(prompt: str, *, system: Optional[str] = None,
             raise RuntimeError("OPENROUTER_API_KEY not set")
         url = "https://openrouter.ai/api/v1/chat/completions"
         model = os.environ.get("CRON_LLM_MODEL", "google/gemini-2.5-flash")
+    elif provider == "zhipu":
+        api_key = os.environ.get("ZHIPU_API_KEY")
+        if not api_key:
+            raise RuntimeError("ZHIPU_API_KEY not set")
+        url = "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        model = os.environ.get("CRON_LLM_MODEL", "glm-5.1")
+        # Reasoning models need more tokens for chain-of-thought overhead
+        max_tokens = max_tokens * 3
     elif provider == "gemini":
         return _gemini_chat(prompt, system=system, json_mode=json_mode,
                             max_tokens=max_tokens, temperature=temperature)
@@ -57,7 +65,13 @@ def llm_chat(prompt: str, *, system: Optional[str] = None,
         json=payload, timeout=60.0,
     )
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    choice = resp.json()["choices"][0]["message"]
+    content = choice.get("content") or ""
+    # Reasoning models (e.g. glm-5.1) put chain-of-thought in reasoning_content;
+    # the actual answer is in content — if empty, the reasoning used all the tokens.
+    if not content.strip() and choice.get("reasoning_content"):
+        raise RuntimeError("reasoning model produced no content (tokens exhausted by reasoning)")
+    return content
 
 
 def _gemini_chat(prompt: str, *, system: Optional[str], json_mode: bool,
