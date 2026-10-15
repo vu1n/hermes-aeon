@@ -1,6 +1,6 @@
 [project]
 name = "hermes-aeon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Aeon memory provider for Hermes-Agent."
 requires-python = ">=3.10"
 dependencies = [

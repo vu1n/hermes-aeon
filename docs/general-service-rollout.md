@@ -1,10 +1,14 @@
 # Opt-in agent-neutral gateway
 
 Aeon owns `brain.general.v1`, revision/CAS, provenance, receipts, indexing and
-live eligibility. Hermes is a trusted in-process compatibility adapter. Other
-agents use `brain_service.client.Client` or MCP; neither receives a DB handle.
-The repository still packages the Hermes provider; splitting distribution,
-remote authentication and health access are outside this milestone.
+live eligibility. Hermes supports two transports for general memory: the
+trusted in-process compatibility adapter (default) and an opt-in
+`general_socket` client mode in which the plugin uses the same
+`brain_service.client.Client` contract as every other bot and fails closed
+without a canonical-DB fallback. Other agents use `brain_service.client.Client`
+or MCP; neither receives a DB handle. The repository still packages the Hermes
+provider; splitting distribution, remote authentication and health access are
+outside this milestone.
 
 ## Contract and synthetic second client
 

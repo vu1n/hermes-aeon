@@ -43,8 +43,10 @@ def test_get_tool_schemas_returns_all(provider):
     schemas = provider.get_tool_schemas()
     names = {s["name"] for s in schemas}
     expected = {
-        # Memory CRUD + query
+        # Memory CRUD + query (general ops go through brain.general.v1)
         "aeon_capture", "aeon_search", "aeon_calendar", "aeon_recent", "aeon_update",
+        # Neutral peer surface (get / propose / retract / status)
+        "aeon_get", "aeon_propose", "aeon_retract", "aeon_status",
         # Tone
         "aeon_set_tone", "aeon_get_tone",
         # Ingest (agent-triggerable fetchers)
@@ -296,3 +298,142 @@ def test_missing_general_gate_has_no_canonical_recall_fallback(provider):
     assert provider.system_prompt_block()==''
     out=provider.handle_tool_call('aeon_search',{'query':'project'})
     assert 'error' in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# brain.general.v1 transport — Hermes as a peer of the other bots
+# ---------------------------------------------------------------------------
+
+class _StubGeneralClient:
+    """Socketless stand-in for brain_service.client.Client backed by a live Gateway."""
+    def __init__(self, gateway):
+        from hermes_aeon.brain_service.policy import API_VERSION
+        self._gateway, self._api_version = gateway, API_VERSION
+    def call(self, operation, arguments):
+        return self._gateway.handle_peer(0, dict(api_version=self._api_version,
+                                                 operation=operation, arguments=arguments))
+
+
+@pytest.fixture
+def gateway_provider(provider):
+    """Provider switched to gateway-client mode: general ops use the same
+    envelope contract as every other bot, with no in-process shortcut."""
+    from hermes_aeon.brain_service.gateway import Gateway
+    from hermes_aeon.brain_service.policy import HERMES
+    gateway = Gateway(provider._db, principals={'hermes': HERMES}, peer_bindings={0: 'hermes'})
+    provider._client = _StubGeneralClient(gateway)
+    return provider
+
+
+def test_general_capture_uses_gateway_provenance(gateway_provider):
+    out = json.loads(gateway_provider.handle_tool_call("aeon_capture", {
+        "domain": "work", "type": "note", "title": "Compiler notes",
+        "content": "Reproducible builds for the compiler project", "tags": ["builds"],
+    }))
+    assert out["status"] == "captured"
+    got = json.loads(gateway_provider.handle_tool_call("aeon_get", {"memory_id": out["id"]}))
+    assert got["found"] is True
+    item = got["item"]
+    assert item["source"] == "chat:hermes"  # server-fixed namespace, like any other bot
+    assert item["provenance"]["capturing_actor"] == "hermes"
+    assert item["record_class"] == "assertion"
+    assert item["topics"] == ["builds"]
+
+
+def test_general_capture_is_idempotent_per_payload(gateway_provider):
+    args = {"domain": "work", "type": "note", "content": "Idempotent capture"}
+    first = json.loads(gateway_provider.handle_tool_call("aeon_capture", args))
+    replay = json.loads(gateway_provider.handle_tool_call("aeon_capture", args))
+    assert first["id"] == replay["id"]
+
+
+def test_non_general_capture_stays_canonical(provider):
+    out = json.loads(provider.handle_tool_call("aeon_capture", {
+        "domain": "inbox", "type": "link", "url": "https://example.com/article",
+    }))
+    assert out["status"] == "captured"
+    row = provider._db.execute("SELECT id FROM memory_items WHERE id=?", (out["id"],)).fetchone()
+    assert row is not None
+    found = json.loads(provider.handle_tool_call("aeon_search", {
+        "query": "example", "domain": "work"}))
+    assert found["count"] == 0  # inbox link captures are not general recall
+
+
+def test_update_replays_receipt_and_reports_conflicts(provider):
+    cap = json.loads(provider.handle_tool_call("aeon_capture", {
+        "domain": "learning", "type": "note", "content": "v1 thought"}))
+    upd = json.loads(provider.handle_tool_call("aeon_update", {
+        "memory_id": cap["id"], "content": "v2 thought, refined", "expected_revision": 1}))
+    assert upd["revision"] == 2
+    replay = json.loads(provider.handle_tool_call("aeon_update", {
+        "memory_id": cap["id"], "content": "v2 thought, refined", "expected_revision": 1}))
+    assert replay == upd  # identical retry replays the receipt; no revision 3
+    stale = json.loads(provider.handle_tool_call("aeon_update", {
+        "memory_id": cap["id"], "content": "v3", "expected_revision": 1}))
+    assert stale["error"] == "revision_conflict"
+    assert stale["current_revision"] == 2
+
+
+def test_propose_get_status_and_retract_lifecycle(provider):
+    cap = json.loads(provider.handle_tool_call("aeon_capture", {
+        "domain": "work", "type": "note", "content": "We chose SQLite for the queue"}))
+    mid = cap["id"]
+    got = json.loads(provider.handle_tool_call("aeon_get", {"memory_id": mid}))
+    assert got["item"]["revision"] == 1
+    proposal = json.loads(provider.handle_tool_call("aeon_propose", {
+        "memory_id": mid, "expected_revision": 1,
+        "statement": "Postgres fits the write volume better", "reason": "Throughput"}))
+    assert proposal["status"] == "proposed"
+    # Proposals never overwrite the target record.
+    assert json.loads(provider.handle_tool_call("aeon_get", {"memory_id": mid}))[
+        "item"]["revision"] == 1
+    status = json.loads(provider.handle_tool_call("aeon_status", {}))
+    assert status["api_version"] == "brain.general.v1"
+    retracted = json.loads(provider.handle_tool_call("aeon_retract", {
+        "memory_id": mid, "expected_revision": 1, "reason": "Superseded"}))
+    assert retracted["status"] == "retracted"
+    assert json.loads(provider.handle_tool_call("aeon_get", {"memory_id": mid}))["found"] is False
+    found = json.loads(provider.handle_tool_call("aeon_search", {"query": "SQLite queue"}))
+    assert found["count"] == 0
+
+
+def test_socket_mode_fails_closed_without_canonical_fallback(provider):
+    from hermes_aeon.brain_service.client import Client
+    provider.handle_tool_call("aeon_capture", {
+        "domain": "work", "type": "note", "content": "Deploy runbook lives in ops repo"})
+    # Opt into gateway mode with an absent socket: the indexed record must not
+    # leak through the canonical DB connection.
+    provider._client = Client("/nonexistent-hermes-aeon.sock")
+    out = provider.handle_tool_call("aeon_search", {"query": "deploy runbook"})
+    assert "error" in out.lower()
+    assert "deploy" not in provider.prefetch("deploy runbook")
+    assert provider.system_prompt_block() == ""
+    capture_out = provider.handle_tool_call("aeon_capture", {
+        "domain": "work", "type": "note", "content": "another note"})
+    assert "error" in capture_out.lower()
+
+
+def test_second_bot_reads_and_proposes_but_cannot_revise_hermes_records(provider):
+    from hermes_aeon.brain_service.gateway import Gateway
+    from hermes_aeon.brain_service.policy import API_VERSION, HERMES, Principal
+    planner = Principal('planner', 'local',
+                        frozenset({'read', 'capture', 'revise_own', 'retract_own', 'propose'}),
+                        'chat:planner')
+    gateway = Gateway(provider._db, principals={'hermes': HERMES, 'planner': planner},
+                      peer_bindings={0: 'hermes', 1: 'planner'})
+
+    def as_planner(operation, arguments):
+        return gateway.handle_peer(1, dict(api_version=API_VERSION,
+                                           operation=operation, arguments=arguments))
+
+    cap = json.loads(provider.handle_tool_call("aeon_capture", {
+        "domain": "side_projects", "type": "note", "content": "Aeon gateway shared with planner"}))
+    mid = cap["id"]
+    seen = as_planner('get', {'id': mid})
+    assert seen['ok'] and seen['result']['item']['id'] == mid
+    denied = as_planner('revise', dict(request_id='p1', memory_id=mid, expected_revision=1,
+                                       reason='Nope', patch={'statement': 'planner rewrite'}))
+    assert not denied['ok']
+    proposal = as_planner('propose', dict(request_id='p2', memory_id=mid, expected_revision=1,
+                                          reason='Alternative', statement='Planner disagrees'))
+    assert proposal['ok'], proposal

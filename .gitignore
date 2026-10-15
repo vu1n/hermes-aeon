@@ -12,3 +12,4 @@ __pycache__/
 *.sqlite-shm
 *.sqlite-journal
 .DS_Store
+.pi/

@@ -63,9 +63,34 @@ def _install_subpackage(rel: str) -> None:
         sys.modules.pop(full, None)
 
 
+def _install_namespace(rel: str) -> None:
+    """Register `{_PKG}.{rel}` as a namespace package (directory, no __init__.py).
+
+    Needed for ``aeon_readonly``: brain_service.policy imports
+    ``..aeon_readonly.projection.policy`` relative to the plugin package, so the
+    intermediate level must exist in sys.modules with a real __path__.
+    """
+    full = f"{_PKG}.{rel}"
+    if full in sys.modules:
+        return
+    parent, _, leaf = full.rpartition(".")
+    if parent not in sys.modules:
+        return
+    mod = types.ModuleType(full)
+    mod.__path__ = [str(_HERE / rel.replace(".", "/"))]
+    sys.modules[full] = mod
+    setattr(sys.modules[parent], leaf, mod)
+
+
 _ensure_parent_namespaces()
 _evict_broken_children()
-for _sub in ("store", "tone", "tools", "tools.browser_providers", "ingest"):
+# Order matters: aeon_readonly has no __init__.py and must be registered as a
+# namespace before its projection child; brain_service.policy pulls
+# aeon_readonly.projection.policy and brain_service.service pulls
+# store.shared_writer at exec time.
+_install_namespace("aeon_readonly")
+for _sub in ("store", "aeon_readonly.projection", "brain_service",
+             "tone", "tools", "tools.browser_providers", "ingest"):
     _install_subpackage(_sub)
 
 

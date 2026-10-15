@@ -31,8 +31,15 @@ DOMAINS = sorted(q.VALID_DOMAINS)
 TYPES = sorted(q.VALID_TYPES)
 TONE_PRESET_NAMES = sorted(PRESETS.keys())
 
+# brain.general.v1 scope (brain_service.policy.DOMAINS); mirrors the neutral
+# client surface other agents use. Imports the policy lazily in handlers —
+# keep module import light under the Hermes host.
+GENERAL_DOMAINS = frozenset({"work", "learning", "side_projects"})
+_GENERAL_STATEMENT_LIMIT = 100_000  # brain_service.service.bounded_text bound
+
 _DOMAIN_FIELD = {"type": "string", "enum": DOMAINS}
 _TYPE_FIELD = {"type": "string", "enum": TYPES}
+_MEMORY_ID_FIELD = {"type": "string", "pattern": "^[a-f0-9]{32}$"}
 
 CAPTURE_SCHEMA = {
     "name": "aeon_capture",
@@ -40,7 +47,10 @@ CAPTURE_SCHEMA = {
         "Save a memory to the personal knowledge base. Use for notes, links, "
         "calendar events, contacts, health logs, files. Pass `url` to extract "
         "and store a webpage; pass `content` for raw text. Always picks a domain "
-        "and type — no inbox dumping."
+        "and type — no inbox dumping. Plain notes in work/learning/side_projects "
+        "are stored as general brain assertions shared with other agents; other "
+        "shapes stay in the canonical local store. Captures are idempotent: "
+        "retrying the identical payload returns the original receipt."
     ),
     "parameters": {
         "type": "object",
@@ -51,8 +61,10 @@ CAPTURE_SCHEMA = {
             "url": {"type": "string", "description": "If present, extracted via configured extractor."},
             "title": {"type": "string"},
             "summary": {"type": "string"},
-            "tags": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Stored as general topics for general captures."},
             "project_id": {"type": "string"},
+            "record_class": {"type": "string", "enum": ["assertion", "working_context"],
+                             "description": "General captures only. working_context expires after 14 days unless expires_at is set."},
             "event_start_ms": {"type": "integer", "description": "Unix ms; for calendar_event."},
             "event_end_ms": {"type": "integer"},
         },
@@ -72,6 +84,7 @@ SEARCH_SCHEMA = {
             "project_id": {"type": "string"},
             "topic": {"type":"string"},
             "source": {"type":"string"},
+            "record_class": {"type":"string","enum":["evidence","assertion","working_context","derived_view"]},
             "limit": {"type": "integer", "default": 10},
         },
         "required": ["query"],
@@ -95,11 +108,15 @@ CALENDAR_SCHEMA = {
 
 UPDATE_SCHEMA = {
     "name": "aeon_update",
-    "description": "Append a revision to an existing memory. Tracks how a concept evolves over time.",
+    "description": (
+        "Append a revision to an existing memory. Tracks how a concept evolves over time. "
+        "Only the capturing agent can revise a general record; retries of the identical "
+        "edit return the original receipt instead of a new revision."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
-            "memory_id": {"type": "string"},
+            "memory_id": _MEMORY_ID_FIELD,
             "expected_revision": {"type": "integer", "minimum": 1},
             "content": {"type": "string"},
             "summary": {"type": "string"},
@@ -107,6 +124,66 @@ UPDATE_SCHEMA = {
         },
         "required": ["memory_id", "content", "expected_revision"],
     },
+}
+
+GET_SCHEMA = {
+    "name": "aeon_get",
+    "description": (
+        "Fetch one general memory by id with full provenance (capturing/editing actor, "
+        "record class, topics, evidence refs). Returns found=false for retracted, "
+        "expired or restricted records — never a stale copy."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"memory_id": _MEMORY_ID_FIELD},
+        "required": ["memory_id"],
+    },
+}
+
+PROPOSE_SCHEMA = {
+    "name": "aeon_propose",
+    "description": (
+        "Disagree safely: propose a separate contradicting assertion linked to another "
+        "agent's record without overwriting it. Cross-agent corrections never rewrite "
+        "another agent's statement."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": _MEMORY_ID_FIELD,
+            "expected_revision": {"type": "integer", "minimum": 1,
+                                  "description": "Revision of the target you are responding to."},
+            "statement": {"type": "string", "description": "Your competing claim."},
+            "reason": {"type": "string"},
+        },
+        "required": ["memory_id", "expected_revision", "statement", "reason"],
+    },
+}
+
+RETRACT_SCHEMA = {
+    "name": "aeon_retract",
+    "description": (
+        "Withdraw one of your own general records. Appends a retracted revision; the "
+        "record immediately disappears from recall. You cannot retract other agents' records."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": _MEMORY_ID_FIELD,
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "reason": {"type": "string"},
+        },
+        "required": ["memory_id", "expected_revision", "reason"],
+    },
+}
+
+STATUS_SCHEMA = {
+    "name": "aeon_status",
+    "description": (
+        "Report the general brain service contract: api/policy versions, commit and "
+        "index sequences. Use to check that writes are visible before searching."
+    ),
+    "parameters": {"type": "object", "properties": {}},
 }
 
 SET_TONE_SCHEMA = {
@@ -210,6 +287,7 @@ RECENT_SCHEMA = {
                        "description": "Source prefix filter. Examples: 'discover:' (all discoveries), 'discover:hn', 'discover:x', 'discover:hf-papers', 'github:', 'x-bookmark'."},
             "domain": _DOMAIN_FIELD,
             "type": _TYPE_FIELD,
+            "record_class": {"type":"string","enum":["evidence","assertion","working_context","derived_view"]},
             "order": {"type": "string", "enum": ["score", "captured_at"], "default": "score",
                       "description": "score: highest quality first (unscored items go last). captured_at: most recent first."},
         },
@@ -244,6 +322,13 @@ class AeonMemoryProvider(MemoryProvider):
         # Only jina is implemented today; firecrawl support would land alongside its provider wrapper.
         self._extractor: str = self._config.get("extractor", "jina")
         self._auto_extract: bool = bool(self._config.get("auto_extract", True))
+        # brain.general.v1 transport. Empty -> the trusted in-process adapter
+        # (Gateway over our canonical DB, the historical behavior). Set -> this
+        # plugin is a plain gateway client like every other bot; general ops go
+        # over the socket and fail closed (never a canonical-DB fallback).
+        self._general_socket: str = str(self._config.get("general_socket", "") or "").strip()
+        self._client = None
+        self._gateway = None
         self._handlers: Dict[str, Any] = {}
 
     @property
@@ -256,6 +341,7 @@ class AeonMemoryProvider(MemoryProvider):
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
             {"key": "db_path", "description": "libSQL database path", "default": "$HERMES_HOME/aeon.db"},
+            {"key": "general_socket", "description": "brain.general.v1 gateway socket; empty uses the trusted in-process adapter", "default": ""},
             {"key": "embed_provider", "description": "Embedding backend", "default": "gemini", "choices": ["gemini", "none"]},
             {"key": "extractor", "description": "URL content extractor", "default": "jina", "choices": ["jina"]},
             {"key": "auto_extract", "description": "Auto-extract memories on session end", "default": "true", "choices": ["true", "false"]},
@@ -295,12 +381,25 @@ class AeonMemoryProvider(MemoryProvider):
         tone_path = hermes_home / "hermes-aeon" / "tone.json"
         self._tone = ToneStore(tone_path)
         self._session_id = session_id
+        if self._general_socket:
+            from .brain_service.client import Client
+            self._client = Client(self._general_socket)
+        else:
+            # Same Gateway/Service boundary the socket server uses, driven
+            # in-process under the trusted hermes principal.
+            from .brain_service.gateway import Gateway
+            from .brain_service.policy import HERMES
+            self._gateway = Gateway(self._db, principals={"hermes": HERMES}, peer_bindings={0: "hermes"})
         self._handlers = {
             "aeon_capture": self._handle_capture,
             "aeon_search": self._handle_search,
             "aeon_calendar": self._handle_calendar,
             "aeon_recent": self._handle_recent,
             "aeon_update": self._handle_update,
+            "aeon_get": self._handle_get,
+            "aeon_propose": self._handle_propose,
+            "aeon_retract": self._handle_retract,
+            "aeon_status": self._handle_status,
             "aeon_set_tone": self._handle_set_tone,
             "aeon_get_tone": self._handle_get_tone,
             # Ingest tools — agent-triggerable fetchers
@@ -315,32 +414,75 @@ class AeonMemoryProvider(MemoryProvider):
             "aeon_digest": self._handle_digest,
         }
 
+    # -- brain.general.v1 transport ------------------------------------------
+
+    def _general_call(self, operation: str, arguments: dict) -> dict:
+        """One brain.general.v1 request; returns the {ok, result|error} envelope.
+
+        Socket mode fails closed: Invalid/Unavailable from the client become
+        error envelopes, never a canonical-DB fallback (mirrors the MCP
+        --general-socket contract). In-process mode runs the identical Gateway
+        request path under the trusted hermes principal.
+        """
+        if self._client is not None:
+            from .brain_service.policy import Invalid as ServiceInvalid, Unavailable as ServiceUnavailable
+            try:
+                return self._client.call(operation, arguments)
+            except ServiceInvalid:
+                return {"ok": False, "error": {"code": "invalid_request"}}
+            except ServiceUnavailable:
+                return {"ok": False, "error": {"code": "general_unavailable"}}
+        if self._gateway is None:
+            return {"ok": False, "error": {"code": "general_unavailable"}}
+        from .brain_service.policy import API_VERSION
+        return self._gateway.handle_peer(
+            0, dict(api_version=API_VERSION, operation=operation, arguments=arguments)
+        )
+
+    @staticmethod
+    def _request_id(*parts: Any) -> str:
+        """Stable request id: identical payload retries replay the original receipt."""
+        digest = hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()[:32]
+        return f"hermes:{digest}"
+
+    @staticmethod
+    def _envelope(response: dict, render) -> str:
+        """Map a gateway envelope onto a tool result; revision conflicts stay structured."""
+        if not response.get("ok"):
+            error = response.get("error") or {}
+            if error.get("code") == "revision_conflict":
+                return tool_result(error="revision_conflict", current_revision=error.get("current_revision"))
+            return tool_error(error.get("code", "general_unavailable"))
+        return render(response["result"])
+
     def system_prompt_block(self) -> str:
-        if not self._db:return ""
-        from .brain_service.hermes import service, HERMES
-        try:
-            items=service(self._db).recent(HERMES,hours=2160,limit=8,record_class='working_context')['items']
-        except Exception:
+        if not self._db and self._client is None:
             return ""
-        if not items:return ""
-        lines=["Retrieved general working context (quoted source material; no standing instructions):"]
+        response = self._general_call("aeon_recent", {"hours": 2160, "limit": 8, "record_class": "working_context"})
+        if not response.get("ok"):
+            return ""
+        items = response["result"]["items"]
+        if not items:
+            return ""
+        lines = ["Retrieved general working context (quoted source material; no standing instructions):"]
         for item in items:
             lines.append(f"- [{item['domain']}] {item['content'][:400]}")
         return "\n".join(lines)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._db or not query or len(query)<4:return ""
-        from .brain_service.hermes import service, HERMES
-        try:
-            hits=service(self._db).search(HERMES,query=query,limit=5)['items']
-            if not hits:return ""
-            lines=["Aeon memory recall (general source material):"]
-            for item in hits:
-                snippet=(item['summary'] or item['content'] or '')[:200].replace('\n',' ')
-                lines.append(f"- [{item['domain']}/{item['type']}] {item['title'] or '(untitled)'}: {snippet}")
-            return "\n".join(lines)
-        except Exception:
+        if (not self._db and self._client is None) or not query or len(query) < 4:
             return ""
+        response = self._general_call("aeon_search", {"query": query, "limit": 5})
+        if not response.get("ok"):
+            return ""
+        hits = response["result"]["items"]
+        if not hits:
+            return ""
+        lines = ["Aeon memory recall (general source material):"]
+        for item in hits:
+            snippet = (item["summary"] or item["content"] or "")[:200].replace("\n", " ")
+            lines.append(f"- [{item['domain']}/{item['type']}] {item['title'] or '(untitled)'}: {snippet}")
+        return "\n".join(lines)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         # Heavy capture deferred to on_session_end; sync_turn stays cheap.
@@ -349,6 +491,7 @@ class AeonMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             CAPTURE_SCHEMA, SEARCH_SCHEMA, CALENDAR_SCHEMA, RECENT_SCHEMA, UPDATE_SCHEMA,
+            GET_SCHEMA, PROPOSE_SCHEMA, RETRACT_SCHEMA, STATUS_SCHEMA,
             SET_TONE_SCHEMA, GET_TONE_SCHEMA,
             PULL_BOOKMARKS_SCHEMA, PULL_GITHUB_SCHEMA,
             PULL_RSS_SCHEMA, PULL_X_SCHEMA, PULL_HF_PAPERS_SCHEMA, PULL_HYPE_SCHEMA,
@@ -356,7 +499,7 @@ class AeonMemoryProvider(MemoryProvider):
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        if not self._db:
+        if not self._db and self._client is None:
             return tool_error("aeon provider not initialized")
         handler = self._handlers.get(tool_name)
         if handler is None:
@@ -392,6 +535,18 @@ class AeonMemoryProvider(MemoryProvider):
             summary = extracted[:400].replace("\n", " ").strip()
         return title, summary
 
+    def _capture_is_general(self, domain: str, type_: str, url, content) -> bool:
+        """Plain notes inside the general scope go through brain.general.v1; URL
+        extractions, calendar/task/link shapes and other domains stay canonical
+        (imported evidence via the Hermes compatibility hook)."""
+        return (
+            type_ == "note"
+            and not url
+            and isinstance(content, str)
+            and 0 < len(content) <= _GENERAL_STATEMENT_LIMIT
+            and domain in GENERAL_DOMAINS
+        )
+
     def _handle_capture(self, args: dict) -> str:
         domain = args["domain"]
         type_ = args["type"]
@@ -399,7 +554,6 @@ class AeonMemoryProvider(MemoryProvider):
         content = args.get("content")
         title = args.get("title")
         summary = args.get("summary")
-        source = args.get("source") or ("manual" if not url else self._extractor)
 
         if url and not content:
             extracted = jina.extract(url) if self._extractor == "jina" else None
@@ -412,6 +566,30 @@ class AeonMemoryProvider(MemoryProvider):
         if not content and not url:
             return tool_error("aeon_capture requires content or url")
 
+        if self._capture_is_general(domain, type_, url, content):
+            record_class = args.get("record_class") or "assertion"
+            gateway_args = {
+                "request_id": self._request_id("capture", domain, content, title, summary,
+                                               tuple(sorted(args.get("tags") or [])),
+                                               args.get("project_id"), record_class),
+                "domain": domain,
+                "statement": content,
+                "record_class": record_class,
+                "topics": args.get("tags") or [],
+            }
+            if title:
+                gateway_args["title"] = title[:300]
+            if summary:
+                gateway_args["summary"] = summary[:2000]
+            if args.get("project_id"):
+                gateway_args["project_id"] = args["project_id"]
+            response = self._general_call("aeon_capture", gateway_args)
+            return self._envelope(response, lambda result: tool_result(
+                id=result["memory_id"], status="captured",
+                revision=result.get("revision", 1),
+                search_visibility=result.get("search_visibility")))
+
+        source = args.get("source") or ("manual" if not url else self._extractor)
         dedup_key = "url:" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] if url else None
         emb, model = embed_text(
             (title or "") + "\n" + (summary or content or ""),
@@ -428,42 +606,85 @@ class AeonMemoryProvider(MemoryProvider):
         return tool_result(id=mid, status="captured", embedded=emb is not None)
 
     def _handle_search(self, args: dict) -> str:
-        from .brain_service.hermes import service, HERMES
-        result=service(self._db).search(HERMES,query=args['query'],domain=args.get('domain'),
-            type=args.get('type'),project_id=args.get('project_id'),source=args.get('source'),
-            topic=args.get('topic'),limit=args.get('limit',10))
-        return tool_result(results=result['items'],count=result['count'],indexed_sequence=result['indexed_sequence'])
+        query_args = {"query": args["query"], "limit": args.get("limit", 10)}
+        for field in ("domain", "type", "project_id", "source", "topic", "record_class",
+                      "min_commit_sequence"):
+            if args.get(field) is not None:
+                query_args[field] = args[field]
+        response = self._general_call("aeon_search", query_args)
+        return self._envelope(response, lambda result: tool_result(
+            results=result["items"], count=result["count"],
+            indexed_sequence=result["indexed_sequence"],
+            indexing_pending=result.get("indexing_pending", False)))
 
     def _handle_calendar(self, args: dict) -> str:
         return tool_error('General calendar recall is unavailable until classified revision lineage is supported')
 
     def _handle_recent(self, args: dict) -> str:
-        from .brain_service.hermes import service, HERMES
-        hours=args.get('hours',24)
-        result=service(self._db).recent(HERMES,hours=hours,limit=args.get('limit',20),offset=args.get('offset',0),
-            min_score=args.get('min_score'),source=args.get('source'),domain=args.get('domain'),
-            type=args.get('type'),topic=args.get('topic'),project_id=args.get('project_id'),order=args.get('order','score'))
-        now=q.now_ms()
-        items=[dict(item,snippet=(item['summary'] or item['content'] or '')[:200],
-                    age_hours=round((now-item['captured_at'])/3600000,1)) for item in result['items']]
-        return tool_result(**dict(result,items=items,window_hours=hours))
+        recent_args = {"hours": args.get("hours", 24), "limit": args.get("limit", 20),
+                       "offset": args.get("offset", 0), "order": args.get("order", "score")}
+        for field in ("min_score", "source", "domain", "type", "topic", "project_id",
+                      "record_class"):
+            if args.get(field) is not None:
+                recent_args[field] = args[field]
+        response = self._general_call("aeon_recent", recent_args)
+        def render(result):
+            now = q.now_ms()
+            items = [dict(item, snippet=(item["summary"] or item["content"] or "")[:200],
+                          age_hours=round((now - item["captured_at"]) / 3600000, 1))
+                     for item in result["items"]]
+            return tool_result(**dict(result, items=items, window_hours=recent_args["hours"]))
+        return self._envelope(response, render)
 
     def _handle_update(self, args: dict) -> str:
-        from .store.shared_writer import Conflict, WriteError
         if type(args.get("expected_revision")) is not int or args["expected_revision"] < 1:
             return tool_error("expected_revision is required; read the memory before updating")
-        emb, model = embed_text(args["content"], provider=self._embed_provider)
-        try:
-            rev = q.update_memory_content(
-                self._db, memory_id=args["memory_id"], expected_revision=args["expected_revision"],
-                content=args["content"], summary=args.get("summary"), source=args.get("source"),
-                embedding=emb, embedding_model=model,
-            )
-        except Conflict as error:
-            return tool_result(error="revision_conflict", current_revision=error.current_revision)
-        except WriteError as error:
-            return tool_error(error.code)
-        return tool_result(memory_id=args["memory_id"], revision=rev)
+        # The aeon_correct alias maps this legacy shape onto a typed revision;
+        # the derived request_id makes identical retries replay their receipt.
+        response = self._general_call("aeon_correct", {
+            "request_id": self._request_id("update", args["memory_id"],
+                                           args["expected_revision"], args["content"],
+                                           args.get("summary")),
+            "memory_id": args["memory_id"],
+            "expected_revision": args["expected_revision"],
+            "statement": args["content"],
+            **({"summary": args["summary"]} if args.get("summary") else {}),
+        })
+        return self._envelope(response, lambda result: tool_result(
+            memory_id=args["memory_id"], revision=result["revision"]))
+
+    def _handle_get(self, args: dict) -> str:
+        response = self._general_call("get", {"id": args["memory_id"]})
+        return self._envelope(response, lambda result: tool_result(
+            found=result["item"] is not None, item=result["item"]))
+
+    def _handle_propose(self, args: dict) -> str:
+        response = self._general_call("propose", {
+            "request_id": self._request_id("propose", args["memory_id"],
+                                           args["expected_revision"], args["statement"],
+                                           args.get("reason")),
+            "memory_id": args["memory_id"],
+            "expected_revision": args["expected_revision"],
+            "statement": args["statement"],
+            "reason": args["reason"],
+        })
+        return self._envelope(response, lambda result: tool_result(
+            proposal_id=result["memory_id"], status="proposed",
+            search_visibility=result.get("search_visibility")))
+
+    def _handle_retract(self, args: dict) -> str:
+        response = self._general_call("retract", {
+            "request_id": self._request_id("retract", args["memory_id"],
+                                           args["expected_revision"], args["reason"]),
+            "memory_id": args["memory_id"],
+            "expected_revision": args["expected_revision"],
+            "reason": args["reason"],
+        })
+        return self._envelope(response, lambda result: tool_result(
+            memory_id=args["memory_id"], status="retracted", revision=result["revision"]))
+
+    def _handle_status(self, args: dict) -> str:
+        return self._envelope(self._general_call("status", {}), lambda result: tool_result(**result))
 
     def _handle_set_tone(self, args: dict) -> str:
         sid = self._session_id
