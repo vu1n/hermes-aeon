@@ -1,5 +1,6 @@
 """Exercise actual staged production definitions, with synthetic storage/API stubs."""
 import ast
+import hashlib
 import importlib.util
 import sqlite3
 import sys
@@ -22,6 +23,15 @@ utils=load('fixture_store.utils',PATCHED/'store/utils.py')
 backend=load('fixture_store.db',PATCHED/'store/db.py')
 writer=load('fixture_store.shared_writer',PATCHED/'store/shared_writer.py')
 queries=load('fixture_store.queries',PATCHED/'store/queries.py')
+
+def strip_imports(node):
+    """Remove Import/ImportFrom at any depth; exec'd provider methods get seeded globals."""
+    for field in ('body','orelse','finalbody'):
+        block=getattr(node,field,None)
+        if isinstance(block,list):
+            setattr(node,field,[s for s in block if not isinstance(s,(ast.Import,ast.ImportFrom))])
+    for child in ast.iter_child_nodes(node):
+        strip_imports(child)
 
 class ProductionPatch(unittest.TestCase):
     def setUp(self):
@@ -69,21 +79,38 @@ class ProductionPatch(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT content FROM memory_items WHERE id=?',(mid,)).fetchone()[0],corrected)
 
     def test_actual_provider_schema_handler_conflict(self):
+        """The staged provider update tool maps onto brain.general.v1 via the real
+        Gateway/Service/writer stack: typed revision, receipt replay, CAS conflict."""
+        from brain_service.gateway import Gateway
+        from brain_service.policy import API_VERSION, HERMES
         tree=ast.parse((PATCHED/'provider.py').read_text())
-        schema=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='UPDATE_SCHEMA' for t in n.targets))
-        namespace={};exec(compile(ast.Module(body=[schema],type_ignores=[]),'schema','exec'),namespace)
+        defs=[n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in {'_MEMORY_ID_FIELD','UPDATE_SCHEMA'} for t in n.targets)]
+        namespace={};exec(compile(ast.Module(body=defs,type_ignores=[]),'schema','exec'),namespace)
         self.assertIn('expected_revision',namespace['UPDATE_SCHEMA']['parameters']['required'])
-        method=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='_handle_update')
-        # Substitute only the relative import; execute the real handler body.
-        method.body=[n for n in method.body if not isinstance(n,ast.ImportFrom)]
-        namespace=dict(Conflict=writer.Conflict,WriteError=writer.WriteError,q=queries,
-            embed_text=lambda *a,**k:(None,None),tool_result=lambda **k:k,tool_error=lambda value:dict(error=value))
-        exec(compile(ast.Module(body=[method],type_ignores=[]),'handler','exec'),namespace)
-        target=types.SimpleNamespace(_db=self.db,_embed_provider='synthetic')
+        names={'_general_call','_envelope','_request_id','_handle_update'}
+        methods=[n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name in names]
+        self.assertEqual({m.name for m in methods},names)
+        for method in methods:strip_imports(method)
+        namespace=dict(namespace,Any=object,hashlib=hashlib,API_VERSION=API_VERSION,
+            Invalid=type('Invalid',(ValueError,),{}),Unavailable=type('Unavailable',(RuntimeError,),{}),
+            tool_result=lambda **k:k,tool_error=lambda value:dict(error=value))
+        exec(compile(ast.Module(body=methods,type_ignores=[]),'handlers','exec'),namespace)
+        class Handler:pass
+        handler=Handler()
+        for name in sorted(names):
+            attribute=namespace[name]
+            if isinstance(attribute,staticmethod):attribute=attribute.__func__
+            setattr(handler,name,types.MethodType(attribute,handler) if name in {'_general_call','_handle_update'} else attribute)
+        handler._client=None
+        handler._gateway=Gateway(self.db,principals={'hermes':HERMES},peer_bindings={0:'hermes'})
         mid=queries.capture_memory(self.db,type='note',domain='work',content='Synthetic',source='manual')
         args=dict(memory_id=mid,content='Correction',expected_revision=1)
-        self.assertEqual(namespace['_handle_update'](target,args)['revision'],2)
-        self.assertEqual(namespace['_handle_update'](target,args)['current_revision'],2)
+        self.assertEqual(namespace['_handle_update'](handler,args)['revision'],2)
+        self.assertEqual(namespace['_handle_update'](handler,args)['revision'],2)
+        stale=dict(args,content='Stale correction')
+        conflict=namespace['_handle_update'](handler,stale)
+        self.assertEqual(conflict['error'],'revision_conflict')
+        self.assertEqual(conflict['current_revision'],2)
 
     def test_actual_profile_upsert_passes_revision(self):
         tree=ast.parse((PATCHED/'ingest/_common.py').read_text())

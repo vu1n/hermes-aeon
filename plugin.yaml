@@ -1,6 +1,6 @@
 name: hermes-aeon
-version: 0.1.0
-description: "Aeon memory provider for Hermes — libSQL-backed personal KB with 7 domains × 10 types, hybrid vector+FTS search, append-only revisions, and a 5-axis tone codec."
+version: 0.2.0
+description: "Aeon memory provider for Hermes — libSQL-backed personal KB with 7 domains × 10 types, hybrid vector+FTS search, append-only revisions, and a 5-axis tone codec. General memory runs through the agent-neutral brain.general.v1 gateway (in-process trusted adapter, or socket client like every other bot)."
 author: vu1n
 # Explicit kind=standalone bypasses the auto-coerce-to-exclusive heuristic
 # (triggered by `MemoryProvider` text in __init__.py) so the general plugin
