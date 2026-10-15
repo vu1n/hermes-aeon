@@ -93,6 +93,7 @@ class ProductionPatch(unittest.TestCase):
         for method in methods:strip_imports(method)
         namespace=dict(namespace,Any=object,hashlib=hashlib,API_VERSION=API_VERSION,
             Invalid=type('Invalid',(ValueError,),{}),Unavailable=type('Unavailable',(RuntimeError,),{}),
+            logger=__import__('logging').getLogger('provider-patch'),
             tool_result=lambda **k:k,tool_error=lambda value:dict(error=value))
         exec(compile(ast.Module(body=methods,type_ignores=[]),'handlers','exec'),namespace)
         class Handler:pass

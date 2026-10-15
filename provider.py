@@ -427,17 +427,23 @@ class AeonMemoryProvider(MemoryProvider):
         if self._client is not None:
             from .brain_service.policy import Invalid as ServiceInvalid, Unavailable as ServiceUnavailable
             try:
-                return self._client.call(operation, arguments)
+                response = self._client.call(operation, arguments)
             except ServiceInvalid:
-                return {"ok": False, "error": {"code": "invalid_request"}}
+                response = {"ok": False, "error": {"code": "invalid_request"}}
             except ServiceUnavailable:
-                return {"ok": False, "error": {"code": "general_unavailable"}}
-        if self._gateway is None:
-            return {"ok": False, "error": {"code": "general_unavailable"}}
-        from .brain_service.policy import API_VERSION
-        return self._gateway.handle_peer(
-            0, dict(api_version=API_VERSION, operation=operation, arguments=arguments)
-        )
+                response = {"ok": False, "error": {"code": "general_unavailable"}}
+        else:
+            if self._gateway is None:
+                response = {"ok": False, "error": {"code": "general_unavailable"}}
+            else:
+                from .brain_service.policy import API_VERSION
+                response = self._gateway.handle_peer(
+                    0, dict(api_version=API_VERSION, operation=operation, arguments=arguments)
+                )
+        if not response.get("ok"):
+            logger.warning("brain.general.v1 %s failed: %s", operation,
+                           (response.get("error") or {}).get("code", "unknown"))
+        return response
 
     @staticmethod
     def _request_id(*parts: Any) -> str:
