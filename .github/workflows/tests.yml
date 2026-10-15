@@ -24,5 +24,7 @@ jobs:
         run: python -m unittest discover -s aeon_sharedwrites -v
       - name: Existing read adapter tests
         run: python -m unittest discover -s aeon_readonly -v
+      - name: Aeon Brain MCP tests
+        run: python -m unittest discover -s aeon_brain -v
       - name: Plugin tests
         run: python -m pytest -q

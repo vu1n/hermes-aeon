@@ -2,6 +2,11 @@
 
 Aeon memory provider for [Hermes-Agent](https://github.com/NousResearch/hermes-agent). Personal knowledge base with 7 domains × 10 types, hybrid vector+FTS retrieval, append-only revisions, and a 5-axis tone codec — all local-first via libSQL with optional Turso sync.
 
+> **The brain is MCP-first now.** The memory core ships as a standalone service
+> ([docs/brain-mcp.md](docs/brain-mcp.md)): `python3 -m aeon_brain.mcp` gives any
+> MCP host the full brain over stdio, and `aeon_brain.server` is the
+> multi-bot gateway daemon. Hermes is one client among many.
+
 ## Install
 
 ```bash
