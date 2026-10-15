@@ -51,7 +51,14 @@ class AeonDB:
             logger.warning(
                 "libsql-experimental not installed — vector search disabled, FTS5-only mode"
             )
-            self._conn = sqlite3.connect(self.db_path)
+            # The host initializes the provider once (main thread) and dispatches
+            # tool calls from executor threads; a same-thread-checked connection
+            # turns every general tool into sqlite3.ProgrammingError, which the
+            # gateway envelope reports as an opaque general_unavailable. SQLite's
+            # serialized threading mode makes sharing the connection safe; tool
+            # dispatch is not concurrent per session, and the shared writer's
+            # bounded lock retries cover cross-process writers.
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=5.0)
             self._conn.execute("PRAGMA journal_mode=WAL")
 
     def bootstrap_schema(self) -> None:

@@ -1,5 +1,6 @@
 """End-to-end provider lifecycle against a tmp libSQL/SQLite db."""
 import json
+import threading
 
 import pytest
 
@@ -323,6 +324,23 @@ def gateway_provider(provider):
     gateway = Gateway(provider._db, principals={'hermes': HERMES}, peer_bindings={0: 'hermes'})
     provider._client = _StubGeneralClient(gateway)
     return provider
+
+
+def test_general_tools_work_across_threads(provider):
+    """The host initializes the provider once and dispatches tool calls from
+    executor threads; the connection must not be same-thread-checked."""
+    captured = {}
+
+    def call_tool():
+        captured["status"] = provider.handle_tool_call("aeon_status", {})
+        captured["search"] = provider.handle_tool_call("aeon_search", {"query": "project"})
+
+    worker = threading.Thread(target=call_tool)
+    worker.start()
+    worker.join()
+    assert "error" not in json.loads(captured["status"]).get("error", "")
+    assert "api_version" in json.loads(captured["status"])
+    assert "error" not in json.loads(captured["search"]).get("error", "")
 
 
 def test_general_capture_uses_gateway_provenance(gateway_provider):
