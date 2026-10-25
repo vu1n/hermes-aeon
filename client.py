@@ -115,10 +115,14 @@ class Emerald:
         result = body.get("result") or {}
         structured = result.get("structuredContent")
         if result.get("isError"):
-            detail = structured or [part.get("text") for part in result.get("content") or []]
+            texts = [part.get("text") or "" for part in result.get("content") or []]
             code = structured.get("code") if isinstance(structured, dict) else None
             message = structured.get("message") if isinstance(structured, dict) else None
-            raise EmeraldError(f"{tool}: {detail}", input_refused=code == "INVALID_INPUT", code=code, detail=message)
+            # Emerald's own refusals carry INVALID_INPUT; the MCP SDK reports a schema failure as an
+            # uncoded "Input validation error: ..." text, before Emerald sees the call.
+            refused = code == "INVALID_INPUT" or (code is None and any(t.startswith("Input validation error")
+                                                                       for t in texts))
+            raise EmeraldError(f"{tool}: {structured or texts}", input_refused=refused, code=code, detail=message)
         if not isinstance(structured, dict):
             raise EmeraldError(f"{tool}: result has no structuredContent: {json.dumps(result)[:300]}")
         return structured

@@ -131,6 +131,18 @@ def _json_rpc_error(request):
                                      "error": {"code": -32603, "message": "internal"}})
 
 
+def _uncoded_tool_error(text):
+    """The MCP SDK's shape for an error it raises itself: isError, a text part, no structuredContent."""
+    def reply(request):
+        return event_stream({"jsonrpc": "2.0", "id": json.loads(request.content)["id"],
+                             "result": {"isError": True, "content": [{"type": "text", "text": text}]}})
+    return reply
+
+
+_schema_failure = _uncoded_tool_error("Input validation error: Invalid arguments for tool capture: content too big")
+_uncoded_failure = _uncoded_tool_error("Cannot read properties of undefined")
+
+
 @pytest.mark.parametrize("transport, unreachable, input_refused", [
     (httpx.MockTransport(_connect_error), True, False),
     (_tool_failure("INVALID_INPUT"), False, True),
@@ -141,8 +153,10 @@ def _json_rpc_error(request):
     (_tool_failure("UNAUTHENTICATED"), False, False),
     (_tool_failure("FORBIDDEN"), False, False),
     (_tool_failure("UNAVAILABLE"), False, False),
+    (httpx.MockTransport(_schema_failure), False, True),
+    (httpx.MockTransport(_uncoded_failure), False, False),
 ], ids=["unreachable", "INVALID_INPUT", "401", "503", "html", "json-rpc", "UNAUTHENTICATED", "FORBIDDEN",
-        "UNAVAILABLE"])
+        "UNAVAILABLE", "schema", "uncoded"])
 def test_errors_say_whether_emerald_answered_and_whether_it_refused_the_input(transport, unreachable, input_refused):
     with pytest.raises(client.EmeraldError) as raised:
         client.Emerald("http://aeon/mcp", "k", transport=transport).call("capture", {})
