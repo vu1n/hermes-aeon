@@ -559,6 +559,42 @@ def test_a_session_that_ended_is_not_saved_again_on_the_switch(provider, drained
     assert drained == [["hermes-session:s1:0:1"]]
 
 
+def test_a_late_turn_of_a_departed_session_is_saved_under_that_session(provider, drained, tmp_path):
+    chat = provider.EmeraldSessionProvider()
+    chat.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+    chat.on_session_switch("s2", reset=False, reason="resumed_other")  # s1's last turn not synced yet
+    chat.sync_turn("q", "a", session_id="s1", messages=MESSAGES)        # ...arrives after the switch
+    chat.on_session_switch("s3", reset=False, reason="branched")
+    assert drained == [["hermes-session:s1:0:1"]]
+
+
+def test_a_late_turn_of_a_departed_session_is_saved_when_the_next_one_ends(provider, drained, tmp_path):
+    chat = provider.EmeraldSessionProvider()
+    chat.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+    chat.on_session_switch("s2", reset=False, reason="resumed_other")
+    chat.sync_turn("q", "a", session_id="s1", messages=MESSAGES)
+    chat.on_session_end([*MESSAGES, {"role": "user", "content": "And in s2?"}])
+    assert sorted(drained[0]) == ["hermes-session:s1:0:1", "hermes-session:s2:0:1"]
+
+
+def test_a_failed_save_on_switch_still_moves_to_the_new_session(provider, tmp_path, monkeypatch):
+    monkeypatch.setattr(provider.Emerald, "from_settings", classmethod(lambda cls, home, key: object.__new__(cls)))
+    monkeypatch.setattr(provider.Emerald, "close", lambda self: None)
+    seen = []
+
+    def drain(emerald, spool):
+        seen.append(sorted(json.loads(p.read_text())["thread_id"] for p in spool.pending()))
+        if len(seen) == 1:
+            raise OSError("disk full")
+        return 0
+    monkeypatch.setattr(provider, "drain", drain)
+    chat = started(provider, tmp_path)
+    with pytest.raises(OSError):
+        chat.on_session_switch("s2", reset=False, reason="resumed_other")
+    chat.on_session_end([{"role": "user", "content": "Now in s2"}])
+    assert "s2" in seen[-1]
+
+
 def test_a_rewind_is_not_a_departure(provider, drained, tmp_path):
     started(provider, tmp_path).on_session_switch("s1", rewound=True)
     assert drained == []

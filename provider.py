@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
@@ -35,8 +35,8 @@ class EmeraldSessionProvider(MemoryProvider):
         self._session_id = ""
         self._platform = ""
         self._writes = False
-        # The transcript as of the last turn, until the session is saved.
-        self._latest: Optional[List[Dict[str, Any]]] = None
+        # (session id, transcript) as of the last turn, until that session is saved.
+        self._latest: Optional[Tuple[str, List[Dict[str, Any]]]] = None
 
     @property
     def name(self) -> str:
@@ -68,43 +68,51 @@ class EmeraldSessionProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: Optional[List[Dict[str, Any]]] = None, **kwargs: Any) -> None:
-        # Hermes passes the redacted transcript after each turn (off the main thread; this only keeps it).
+        # Hermes passes the redacted transcript after each turn, off the main thread, so it can arrive
+        # after a switch: it keeps the id of the session it belongs to.
         if messages is not None:
-            self._latest = list(messages)
+            self._latest = (session_id or self._session_id, list(messages))
 
     def on_session_switch(self, new_session_id: str, **kwargs: Any) -> None:
         # /resume and /branch leave a session without on_session_end; /new and compaction end it first,
-        # which clears the snapshot. A rewind keeps the id and is not a departure.
-        if new_session_id != self._session_id and self._latest:
-            self._save(self._latest)
+        # which clears the snapshot. A rewind keeps the id: its snapshot holds turns the user undid, so it
+        # is dropped. The new id is taken first, so a failed save cannot leave the next session's
+        # transcript filed under the old id.
+        snapshot, self._latest = self._latest, None
         self._session_id = new_session_id
-        self._latest = None
+        if snapshot and snapshot[0] != new_session_id:
+            self._save([snapshot])
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        self._save(messages)
-        self._latest = None
+        snapshot, self._latest = self._latest, None
+        # A late turn of a session already left still belongs to that session.
+        stale = [snapshot] if snapshot and snapshot[0] != self._session_id else []
+        self._save([*stale, (self._session_id, messages)])
 
-    def _save(self, messages: List[Dict[str, Any]]) -> None:
+    def _save(self, sessions: List[Tuple[str, List[Dict[str, Any]]]]) -> None:
         if not self._writes:
             return
         ended_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        captures = session_captures(self._session_id, messages or [], ended_at=ended_at,
-                                    platform=self._platform or None)
         spool_dir = self._home / "aeon-emerald" / "spool"
         spool = Spool(spool_dir)
         # Spool first: an outage, a crash or an interrupted send then loses nothing.
-        for arguments in captures:
-            spool.put(arguments)
+        captured = []
+        for session_id, messages in sessions:
+            captures = session_captures(session_id, messages or [], ended_at=ended_at,
+                                        platform=self._platform or None)
+            for arguments in captures:
+                spool.put(arguments)
+            captured += [session_id] if captures else []
         if not spool.pending():
             return
         try:
             client = Emerald.from_settings(self._home, KEY_SETTING)
         except SettingMissing as error:
-            logger.error("aeon-emerald: session %s not sent, captures wait in %s: %s", self._session_id, spool_dir, error)
+            logger.error("aeon-emerald: %s not sent, captures wait in %s: %s", captured, spool_dir, error)
             return
         try:
             waiting = drain(client, spool)
         finally:
             client.close()
-        if captures and not waiting:
-            logger.info("aeon-emerald: captured session %s (%d part(s))", self._session_id, len(captures))
+        if captured and not waiting:
+            logger.info("aeon-emerald: captured session(s) %s", ", ".join(captured))
