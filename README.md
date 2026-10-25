@@ -7,6 +7,25 @@ Aeon memory provider for [Hermes-Agent](https://github.com/NousResearch/hermes-a
 > MCP host the full brain over stdio, and `aeon_brain.server` is the
 > multi-bot gateway daemon. Hermes is one client among many.
 
+## Aeon Emerald (current memory)
+
+Hermes now keeps long-term memory in [Aeon Emerald](https://github.com/vu1n/aeon-emerald); the
+libSQL brain below is a read-only archive. `aeon_emerald/` holds what Hermes needs:
+
+- **Recall** is Emerald's own MCP server: `mcp_servers.aeon` with `url` and an
+  `Authorization: Bearer ${AEON_EMERALD_KEY}` header. No plugin code is involved.
+- **Session capture** is `aeon_emerald/` as a capture-only memory provider: link it as
+  `$HERMES_HOME/plugins/aeon-emerald` and set `memory.provider: aeon-emerald`. Each ended primary
+  session is captured as a `transcript` (`hermes-session:<id>`); failed captures wait in
+  `$HERMES_HOME/aeon-emerald/spool/` and are re-sent at the next session end.
+- **Cron scripts** in `aeon_emerald/jobs/`: `oura_pull.py` (no-agent job) and `digest_inputs.py`
+  (FreshRSS + Emerald timeline, fed to the digest prompt). Hermes scrubs secrets from script
+  environments, so they read `$HERMES_HOME/.env` themselves.
+
+Settings in `$HERMES_HOME/.env`: `AEON_EMERALD_URL`, `AEON_EMERALD_KEY` (Hermes's principal),
+`AEON_EMERALD_OURA_KEY` (a capture-only principal with the `health` sensitivity), `OURA_PAT`,
+`FRESHRSS_URL`, `FRESHRSS_USER`, `FRESHRSS_API_PASSWORD`.
+
 ## Install
 
 ```bash
