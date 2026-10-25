@@ -310,15 +310,13 @@ def test_watermark_starts_a_window_back_then_follows_the_newest_crawl(tmp_path):
     assert mark.since(later, 24) == int((later - digest.MAX_FEED_LOOKBACK).timestamp())
 
 
-def test_password_comes_from_the_freshrss_env_file_unless_already_in_the_environment(tmp_path, monkeypatch):
+def test_password_comes_only_from_the_freshrss_env_file(tmp_path, monkeypatch):
     digest = load_job("digest_inputs")
     (tmp_path / "freshrss.env").write_text("TZ=UTC\nADMIN_API_PASSWORD=from-file\n")
     (tmp_path / ".env").write_text(f"FRESHRSS_PASSWORD_FILE={tmp_path / 'freshrss.env'}\n"
                                    "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n")
-    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
+    monkeypatch.setenv("FRESHRSS_API_PASSWORD", "from-env")  # not a source
     assert digest.freshrss_password(tmp_path) == "from-file"
-    monkeypatch.setenv("FRESHRSS_API_PASSWORD", "from-env")
-    assert digest.freshrss_password(tmp_path) == "from-env"
 
 
 @pytest.mark.parametrize("freshrss_env, error", [
@@ -333,7 +331,6 @@ def test_missing_password_source_is_reported(tmp_path, monkeypatch, capsys, fres
                                    f"FRESHRSS_PASSWORD_FILE={tmp_path / 'freshrss.env'}\n"
                                    "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
     assert digest.main([]) == 1
     assert error in capsys.readouterr().err
 
@@ -354,7 +351,6 @@ def test_digest_reads_both_sources_and_advances_the_watermark(tmp_path, monkeypa
                                    "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n"
                                    "AEON_EMERALD_URL=http://aeon/mcp\nAEON_EMERALD_KEY=k\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
     pages = {"": {"items": [{"title": "A", "crawlTimeMsec": "1792900000999", "origin": {"title": "F"}}]}}
     rss, real_client = freshrss(pages), httpx.Client
     # Only the FreshRSS client is built without a transport; Emerald's below gets the fake MCP one.

@@ -5,9 +5,8 @@ Exits 1 with the error on stderr if either source cannot be read, so the digest 
 drops a source.
 
 The FreshRSS API password is never copied to another file: it is read at run time from the FreshRSS
-deployment's own env file (``FRESHRSS_PASSWORD_FILE``, variable ``FRESHRSS_PASSWORD_VAR``) and kept
-in memory, unless ``FRESHRSS_API_PASSWORD`` is already in the environment (e.g. under tumbler).
-FreshRSS is read-only here (the account is shared with the owner's own reading); which items were
+deployment's own env file, named by the ``FRESHRSS_PASSWORD_FILE`` and ``FRESHRSS_PASSWORD_VAR``
+settings, and kept in memory. FreshRSS is read-only here (the account is shared with the owner's own reading); which items were
 already digested is tracked locally as the newest ``crawlTimeMsec`` seen, passed back as ``ot``.
 
     digest_inputs.py [--hours N]
@@ -30,7 +29,6 @@ from client import Emerald, EmeraldError, SettingMissing, read_env_file, setting
 
 GREADER = "/api/greader.php"
 READING_LIST = "/reader/api/0/stream/contents/user/-/state/com.google/reading-list"
-PASSWORD = "FRESHRSS_API_PASSWORD"
 SNIPPET = 280
 TIMELINE_PAGE = 100
 TIMELINE_PAGES = 10
@@ -47,9 +45,7 @@ def _plain(markup: str) -> str:
 
 
 def freshrss_password(home: Path) -> str:
-    """The API password, held only in memory: from the environment, else the FreshRSS deployment's env file."""
-    if os.environ.get(PASSWORD):
-        return os.environ[PASSWORD]
+    """The API password from the FreshRSS deployment's env file, held only in memory."""
     source, variable = Path(setting("FRESHRSS_PASSWORD_FILE", home)), setting("FRESHRSS_PASSWORD_VAR", home)
     if not source.is_file():
         raise SourceError(f"FreshRSS env file {source} not found")
@@ -154,7 +150,6 @@ def render(feeds: list[dict[str, Any]], memory: list[dict[str, Any]], hours: int
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--hours", type=int, default=24)
     args = parser.parse_args(argv)

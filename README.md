@@ -57,8 +57,7 @@ Hermes scrubs secrets from cron script environments, so the jobs read `$HERMES_H
 | `FRESHRSS_PASSWORD_FILE`, `FRESHRSS_PASSWORD_VAR` | digest | where the FreshRSS deployment keeps the API password |
 
 The FreshRSS API password is never copied to another file: the digest reads it at run time from
-the FreshRSS deployment's own env file and keeps it in memory. `FRESHRSS_API_PASSWORD` in the
-environment (e.g. under `tumbler run`) takes precedence.
+the FreshRSS deployment's own env file and keeps it in memory. That file is its only source.
 
 ## Tests
 
