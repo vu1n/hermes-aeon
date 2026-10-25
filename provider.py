@@ -7,6 +7,7 @@ provider exists because only memory providers receive the full transcript at a r
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -69,7 +70,9 @@ class EmeraldSessionProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         if not self._writes:
             return
-        captures = session_captures(self._session_id, messages or [], platform=self._platform or None)
+        ended_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        captures = session_captures(self._session_id, messages or [], ended_at=ended_at,
+                                    platform=self._platform or None)
         spool_dir = self._home / "aeon-emerald" / "spool"
         spool = Spool(spool_dir)
         # Spool first: an outage, a crash or an interrupted send then loses nothing.

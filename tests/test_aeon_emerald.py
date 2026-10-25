@@ -213,39 +213,74 @@ MESSAGES = [
 ]
 
 
-def test_transcript_keeps_only_user_and_assistant_text():
+ENDED = "2026-10-25T10:00:00+00:00"
+SUMMARY = {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted. "
+                                      "## Goal: move Hermes to Emerald", "_compressed_summary": True}
+
+
+def captures_of(session_id, messages=MESSAGES, **kwargs):
+    return session.session_captures(session_id, messages, ended_at=ENDED, **kwargs)
+
+
+def test_transcript_keeps_only_what_the_user_and_hermes_said():
     assert session.transcript_turns(MESSAGES) == [
         "User: What did we decide about the VPS?", "Hermes: We moved Hermes to Emerald."]
 
 
+@pytest.mark.parametrize("summary", [
+    SUMMARY,
+    {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted."},
+    {"role": "assistant", "content": "[CONTEXT SUMMARY]: the user moved Hermes to Emerald"},
+    {"role": "user", "content": "anything", "_compressed_summary": True},
+], ids=["flag-and-prefix", "prefix", "legacy-prefix", "flag"])
+def test_compaction_summaries_are_not_the_users_words(summary):
+    assert session.transcript_turns([summary, *MESSAGES[1:]]) == session.transcript_turns(MESSAGES)
+    assert captures_of("s1", [summary, {"role": "assistant", "content": "ok"}]) == []
+
+
 def test_sessions_without_user_text_are_not_captured():
-    assert session.session_captures("s1", [{"role": "assistant", "content": "Good morning"}]) == []
+    assert captures_of("s1", [{"role": "assistant", "content": "Good morning"}]) == []
 
 
 def test_long_transcripts_split_at_turn_boundaries_and_oversized_turns_are_cut():
-    messages = [{"role": "user", "content": "a" * 40}, {"role": "assistant", "content": "b" * 40},
-                {"role": "user", "content": "c" * 130}]
-    parts = session.transcript_parts(messages, limit=100)
+    turns = [f"User: {'a' * 40}", f"Hermes: {'b' * 40}", f"User: {'c' * 130}"]
+    parts = session.transcript_parts(turns, limit=100)
     assert all(len(p) <= 100 for p in parts)
     assert parts[0] == f"User: {'a' * 40}\n\nHermes: {'b' * 40}"
     assert "".join(parts[1:]) == f"User: {'c' * 130}"
 
 
 def test_turns_that_exactly_fill_a_part_stay_in_one_part():
-    messages = [{"role": "user", "content": "a" * 10}, {"role": "assistant", "content": "b" * 10}]
-    whole = f"User: {'a' * 10}\n\nHermes: {'b' * 10}"
-    assert session.transcript_parts(messages, limit=len(whole)) == [whole]
+    turns = [f"User: {'a' * 10}", f"Hermes: {'b' * 10}"]
+    whole = "\n\n".join(turns)
+    assert session.transcript_parts(turns, limit=len(whole)) == [whole]
 
 
-def test_session_captures_name_parts_and_thread_by_session():
-    one = session.session_captures("s1", MESSAGES, platform="telegram")
-    assert len(one) == 1
-    assert one[0]["source"] == {**one[0]["source"], "kind": "transcript", "external_id": "hermes-session:s1"}
-    assert one[0]["thread_id"] == "s1"
-    assert one[0]["content"].startswith("Hermes session s1 (telegram)\n\nUser: ")
-    long = [{"role": "user", "content": "x" * (session.PART_LIMIT + 10)}]
-    ids = [c["source"]["external_id"] for c in session.session_captures("s2", long)]
-    assert ids == ["hermes-session:s2:part1", "hermes-session:s2:part2"]
+def test_session_captures_are_dated_and_threaded_by_session():
+    (only,) = captures_of("s1", platform="telegram")
+    assert only["source"]["kind"] == "transcript"
+    assert only["source"]["external_id"] == "hermes-session:s1:0:1"
+    assert only["thread_id"] == "s1" and only["occurred_at"] == ENDED
+    assert only["content"].startswith("Hermes session s1 (telegram), part 1\n\nUser: ")
+
+
+def test_a_growing_session_resends_only_its_last_part():
+    fills_part_1 = {"role": "user", "content": "x" * (session.PART_LIMIT - len("User: "))}
+    first = [fills_part_1, {"role": "user", "content": "short"}]
+    later = [*first, {"role": "assistant", "content": "more"}]
+    before, after = captures_of("s2", first), captures_of("s2", later)
+    assert [c["source"]["external_id"] for c in after] == ["hermes-session:s2:0:1", "hermes-session:s2:0:2"]
+    assert before[0] == after[0]  # unchanged part: same operation id, replayed
+    assert before[1]["operation_id"] != after[1]["operation_id"]
+
+
+def test_each_compaction_segment_is_its_own_source():
+    full = captures_of("s1", MESSAGES)
+    compacted = captures_of("s1", [MESSAGES[0], SUMMARY, {"role": "user", "content": "And the digest?"}])
+    grown = captures_of("s1", [MESSAGES[0], SUMMARY, {"role": "user", "content": "And the digest?"},
+                               {"role": "assistant", "content": "It reads FreshRSS."}])
+    assert full[0]["source"]["external_id"] != compacted[0]["source"]["external_id"]
+    assert compacted[0]["source"]["external_id"] == grown[0]["source"]["external_id"]
 
 
 def emerald_with(transport):
@@ -253,7 +288,7 @@ def emerald_with(transport):
 
 
 def spooled(spool, *session_ids):
-    captures = [session.session_captures(sid, MESSAGES)[0] for sid in session_ids]
+    captures = [captures_of(sid)[0] for sid in session_ids]
     for arguments in captures:
         spool.put(arguments)
     return captures
@@ -324,7 +359,7 @@ def test_a_capture_another_session_end_already_sent_is_skipped(tmp_path):
 
 def test_spooled_transcripts_are_readable_only_by_their_owner(tmp_path):
     spool = session.Spool(tmp_path / "spool")
-    path = spool.put(session.session_captures("s1", MESSAGES)[0])
+    path = spool.put(captures_of("s1")[0])
     assert path.stat().st_mode & 0o777 == 0o600
     assert (tmp_path / "spool").stat().st_mode & 0o777 == 0o700
     assert [p.name for p in (tmp_path / "spool").iterdir()] == [path.name]  # no temp file left behind
@@ -356,7 +391,7 @@ def test_provider_captures_primary_sessions_only(provider, drained, tmp_path):
     chat.initialize("s1", hermes_home=str(tmp_path), platform="telegram")
     chat.on_session_switch("s2")
     chat.on_session_end(MESSAGES)
-    assert drained == [["hermes-session:s2"]]
+    assert drained == [["hermes-session:s2:0:1"]]
     assert chat.get_tool_schemas() == []
 
 
@@ -376,11 +411,11 @@ def test_provider_is_available_only_with_url_and_key(provider, tmp_path, monkeyp
 
 
 def test_provider_resends_the_spool_at_a_session_end_with_nothing_new(provider, drained, tmp_path):
-    session.Spool(tmp_path / "aeon-emerald" / "spool").put(session.session_captures("old", MESSAGES)[0])
+    session.Spool(tmp_path / "aeon-emerald" / "spool").put(captures_of("old")[0])
     chat = provider.EmeraldSessionProvider()
     chat.initialize("s1", hermes_home=str(tmp_path), platform="telegram")
     chat.on_session_end([{"role": "assistant", "content": "Good morning"}])
-    assert drained == [["hermes-session:old"]]
+    assert drained == [["hermes-session:old:0:1"]]
 
 
 # -- oura job ---------------------------------------------------------------------------------------------

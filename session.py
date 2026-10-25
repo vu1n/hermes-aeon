@@ -4,6 +4,7 @@ Kept free of Hermes imports so it is testable without the host runtime.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 # Emerald's capture accepts up to 100,000 characters; leave room for the part header.
 PART_LIMIT = 90_000
 _SPEAKERS = {"user": "User", "assistant": "Hermes"}
+# Hermes marks the summary it inserts when it compacts a long context (agent/context_compressor.py) with
+# this key, and starts its text with one of these prefixes (current and historical).
+COMPACTION_FLAG = "_compressed_summary"
+COMPACTION_PREFIXES = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:")
 
 
 def _text(content: Any) -> str:
@@ -28,24 +33,26 @@ def _text(content: Any) -> str:
     return ""
 
 
+def _compaction_summary(message: dict[str, Any]) -> Optional[str]:
+    text = _text(message.get("content"))
+    return text if message.get(COMPACTION_FLAG) or text.startswith(COMPACTION_PREFIXES) else None
+
+
 def transcript_turns(messages: Iterable[dict[str, Any]]) -> list[str]:
-    """User and assistant text, in order. Tool calls, tool results and system messages are left out:
-    they are bulky, and Emerald's extraction should work from what was said."""
+    """What the user and Hermes said, in order. Left out: system messages, tool calls and results (bulky,
+    and Emerald's extraction should work from what was said), and compaction summaries, which Hermes
+    writes and inserts as a user message although the user never said them."""
     turns = []
     for message in messages:
         speaker = _SPEAKERS.get(message.get("role", ""))
         text = _text(message.get("content"))
-        if speaker and text:
+        if speaker and text and _compaction_summary(message) is None:
             turns.append(f"{speaker}: {text}")
     return turns
 
 
-def transcript_parts(messages: Iterable[dict[str, Any]], limit: int = PART_LIMIT) -> list[str]:
-    """The transcript split at turn boundaries into captures of at most ``limit`` characters.
-    Empty when the user said nothing, so sessions with no conversation are not stored."""
-    turns = transcript_turns(messages)
-    if not any(turn.startswith("User: ") for turn in turns):
-        return []
+def transcript_parts(turns: list[str], limit: int = PART_LIMIT) -> list[str]:
+    """The turns split at turn boundaries into parts of at most ``limit`` characters."""
     parts: list[str] = []
     current = ""
     for turn in turns:
@@ -65,19 +72,27 @@ def transcript_parts(messages: Iterable[dict[str, Any]], limit: int = PART_LIMIT
     return parts
 
 
-def session_captures(session_id: str, messages: Iterable[dict[str, Any]], *,
+def session_captures(session_id: str, messages: Iterable[dict[str, Any]], *, ended_at: str,
                      platform: Optional[str] = None) -> list[dict[str, Any]]:
-    """Capture arguments for one ended session. A re-sent identical transcript replays its receipt."""
-    parts = transcript_parts(messages)
+    """Capture arguments for one session's transcript at ``ended_at``; none if the user said nothing.
+
+    A source is one compaction segment of a session, named by the latest compaction summary in the
+    transcript. Hermes compacts in place: it ends the session once with the full turns, then later again
+    under the same id with the summary and the turns since. Without the segment, that later transcript
+    would be stored as a newer revision of the full one and outrank it. A session that only grows keeps
+    its segment, so its newer transcript does replace the older one. Parts are numbered without a total,
+    so growth re-sends only the last part."""
+    messages = list(messages)
+    turns = transcript_turns(messages)
+    if not any(turn.startswith("User: ") for turn in turns):
+        return []
+    summaries = [summary for message in messages if (summary := _compaction_summary(message)) is not None]
+    segment = hashlib.sha256(summaries[-1].encode("utf-8")).hexdigest()[:12] if summaries else "0"
     header = f"Hermes session {session_id}" + (f" ({platform})" if platform else "")
-    captures = []
-    for index, part in enumerate(parts, start=1):
-        suffix = f":part{index}" if len(parts) > 1 else ""
-        label = f"{header}, part {index} of {len(parts)}" if len(parts) > 1 else header
-        captures.append(capture_arguments(
-            content=f"{label}\n\n{part}", kind="transcript",
-            external_id=f"hermes-session:{session_id}{suffix}", thread_id=session_id))
-    return captures
+    return [capture_arguments(content=f"{header}, part {index}\n\n{part}", kind="transcript",
+                              external_id=f"hermes-session:{session_id}:{segment}:{index}",
+                              thread_id=session_id, occurred_at=ended_at)
+            for index, part in enumerate(transcript_parts(turns), start=1)]
 
 
 class Spool:
