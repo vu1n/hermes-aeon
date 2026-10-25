@@ -103,6 +103,21 @@ def test_call_raises_with_tool_name_on_tool_error():
         client.Emerald("http://aeon/mcp", "k", transport=transport).call("fetch", {"id": "x"})
 
 
+@pytest.mark.parametrize("status", ["stored", "duplicate"])
+def test_capture_returns_the_receipt_when_emerald_has_the_episode(status):
+    transport, calls = mcp_server(lambda tool, args: {"status": status, "reason": None})
+    arguments = client.capture_arguments(content="x", kind="text", external_id="x:1")
+    assert client.Emerald("http://aeon/mcp", "k", transport=transport).capture(arguments)["status"] == status
+    assert calls[0][:2] == ("capture", arguments)
+
+
+def test_capture_raises_when_emerald_rejects_the_episode():
+    transport, _ = mcp_server(lambda tool, args: {"status": "rejected_sensitive", "reason": "sensitivity not opted in"})
+    emerald = client.Emerald("http://aeon/mcp", "k", transport=transport)
+    with pytest.raises(client.EmeraldError, match="capture: rejected_sensitive: sensitivity not opted in"):
+        emerald.capture(client.capture_arguments(content="x", kind="text", external_id="x:1"))
+
+
 def test_call_reads_plain_json_replies():
     def reply(request):
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.loads(request.content)["id"],
@@ -218,18 +233,26 @@ def test_provider_spools_when_settings_are_missing(provider, tmp_path):
     assert len(session.Spool(tmp_path / "aeon-emerald" / "spool").pending()) == 1
 
 
+def test_a_rejected_spooled_capture_stays_in_the_spool(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    spool.put(session.session_captures("s1", MESSAGES)[0])
+    transport, _ = mcp_server(lambda tool, args: {"status": "rejected_sensitive", "reason": "not opted in"})
+    assert session.send(client.Emerald("http://aeon/mcp", "k", transport=transport), spool, []) == 1
+    assert len(spool.pending()) == 1
+
+
 # -- oura job ---------------------------------------------------------------------------------------------
 
 def test_oura_rows_become_health_episodes_keyed_by_category_and_day():
     oura = load_job("oura_pull")
     daily = oura.episode("sleep", {"day": "2026-10-24", "score": 81}, oura.render_sleep)
-    assert daily["external_id"] == "oura:sleep:2026-10-24"
+    assert daily["source"] == {**daily["source"], "kind": "text", "external_id": "oura:sleep:2026-10-24"}
     assert daily["occurred_at"] == "2026-10-24T00:00:00Z"
     assert daily["sensitivity"] == ["health"] and daily["project"] == "health"
     assert daily["content"].startswith("Sleep 2026-10-24: score 81\n\n")
     workout = oura.episode("workout", {"day": "2026-10-24", "id": "w1", "start_datetime": "2026-10-24T07:00:00+02:00"},
                            oura.render_workout)
-    assert workout["external_id"] == "oura:workout:2026-10-24:w1"
+    assert workout["source"]["external_id"] == "oura:workout:2026-10-24:w1"
     assert workout["occurred_at"] == "2026-10-24T07:00:00+02:00"
     assert oura.episode("sleep", {"score": 1}, oura.render_sleep) is None
 

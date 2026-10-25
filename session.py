@@ -104,7 +104,7 @@ def send(client: Emerald, spool: Spool, captures: list[dict[str, Any]]) -> int:
     for path in spool.pending():
         arguments = json.loads(path.read_text(encoding="utf-8"))
         try:
-            client.call("capture", arguments)
+            client.capture(arguments)
         except EmeraldError as error:
             failed += 1
             logger.error("aeon-emerald: spooled capture %s still failing: %s", path.name, error)
@@ -112,14 +112,10 @@ def send(client: Emerald, spool: Spool, captures: list[dict[str, Any]]) -> int:
         path.unlink()
     for arguments in captures:
         try:
-            receipt = client.call("capture", arguments)
+            client.capture(arguments)
         except EmeraldError as error:
             failed += 1
             path = spool.put(arguments)
             logger.error("aeon-emerald: capture of %s failed, spooled to %s: %s",
                          arguments["source"]["external_id"], path, error)
-            continue
-        if receipt.get("status") != "stored":
-            logger.warning("aeon-emerald: capture of %s returned %s (%s)",
-                           arguments["source"]["external_id"], receipt.get("status"), receipt.get("reason"))
     return failed

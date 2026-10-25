@@ -19,7 +19,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from client import Emerald, EmeraldError, setting  # noqa: E402
+from client import Emerald, EmeraldError, capture_arguments, setting  # noqa: E402
 
 OURA_API = "https://api.ouraring.com/v2/usercollection"
 KEY_SETTING = "AEON_EMERALD_OURA_KEY"
@@ -93,7 +93,7 @@ def fetch(http: httpx.Client, endpoint: str, start: str, end: str) -> list[dict]
 
 
 def episode(label: str, row: dict, render: Callable[[dict], str]) -> Optional[dict[str, Any]]:
-    """Capture keyword arguments for one Oura row, or None for a row without a day."""
+    """Capture arguments for one Oura row, or None for a row without a day."""
     day = row.get("day")
     if not day:
         return None
@@ -103,8 +103,8 @@ def episode(label: str, row: dict, render: Callable[[dict], str]) -> Optional[di
     else:
         external_id = f"oura:{label}:{day}"
         occurred_at = f"{day}T00:00:00Z"
-    return dict(content=render(row), kind="text", external_id=external_id, occurred_at=occurred_at,
-                project="health", sensitivity=["health"])
+    return capture_arguments(content=render(row), kind="text", external_id=external_id,
+                             occurred_at=occurred_at, project="health", sensitivity=["health"])
 
 
 def run(emerald: Emerald, oura: httpx.Client, days: int, today: Optional[str] = None) -> dict[str, Any]:
@@ -123,13 +123,9 @@ def run(emerald: Emerald, oura: httpx.Client, days: int, today: Optional[str] = 
             if arguments is None:
                 continue
             try:
-                receipt = emerald.capture(**arguments)
+                emerald.capture(arguments)
             except EmeraldError as error:
-                summary["errors"].append(f"capture {arguments['external_id']}: {error}")
-                continue
-            if receipt.get("status") != "stored":
-                summary["errors"].append(f"capture {arguments['external_id']}: {receipt.get('status')} "
-                                         f"({receipt.get('reason')})")
+                summary["errors"].append(f"capture {arguments['source']['external_id']}: {error}")
                 continue
             sent += 1
         summary["sent"][label] = sent

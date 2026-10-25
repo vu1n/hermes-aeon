@@ -107,15 +107,15 @@ class Emerald:
             raise EmeraldError(f"{tool}: result has no structuredContent: {json.dumps(result)[:300]}")
         return structured
 
-    def capture(self, *, content: str, kind: str, external_id: str, thread_id: Optional[str] = None,
-                occurred_at: Optional[str] = None, project: Optional[str] = None,
-                sensitivity: Iterable[str] = (), uri: Optional[str] = None) -> dict[str, Any]:
-        """Capture one episode, idempotent per (external_id, content).
+    def capture(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Send what ``capture_arguments`` built; the receipt if Emerald stored the episode or already had it.
 
-        Re-sending identical content replays the first receipt; changed content is a new version."""
-        return self.call("capture", capture_arguments(
-            content=content, kind=kind, external_id=external_id, thread_id=thread_id,
-            occurred_at=occurred_at, project=project, sensitivity=sensitivity, uri=uri))
+        Re-sending identical content replays the first receipt; changed content is a new version.
+        Any other outcome, such as ``rejected_sensitive``, raises EmeraldError."""
+        receipt = self.call("capture", arguments)
+        if receipt.get("status") not in ("stored", "duplicate"):
+            raise EmeraldError(f"capture: {receipt.get('status')}: {receipt.get('reason')}")
+        return receipt
 
 
 def _response_message(response: httpx.Response, request_id: str) -> dict[str, Any]:
