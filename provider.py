@@ -89,7 +89,15 @@ class EmeraldSessionProvider(MemoryProvider):
         stale = [snapshot] if snapshot and snapshot[0] != self._session_id else []
         self._save([*stale, (self._session_id, messages)])
 
-    def _save(self, sessions: List[Tuple[str, List[Dict[str, Any]]]]) -> None:
+    def shutdown(self) -> None:
+        # Hermes also releases an agent without ending its session (a /reasoning, /fast, /personality,
+        # /moa or model change), and a later exit does not end it either. A transcript not yet saved is
+        # spooled here but not sent, which would hold up the command; the next session end sends it.
+        snapshot, self._latest = self._latest, None
+        if snapshot:
+            self._save([snapshot], send=False)
+
+    def _save(self, sessions: List[Tuple[str, List[Dict[str, Any]]]], *, send: bool = True) -> None:
         if not self._writes:
             return
         ended_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -103,7 +111,7 @@ class EmeraldSessionProvider(MemoryProvider):
             for arguments in captures:
                 spool.put(arguments)
             captured += [session_id] if captures else []
-        if not spool.pending():
+        if not send or not spool.pending():
             return
         try:
             client = Emerald.from_settings(self._home, KEY_SETTING)

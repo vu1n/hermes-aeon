@@ -609,6 +609,23 @@ def test_a_failed_save_on_switch_still_moves_to_the_new_session(provider, tmp_pa
     assert "s2" in seen[-1]
 
 
+def test_a_released_agent_spools_its_unsaved_transcript_without_sending(provider, drained, tmp_path):
+    # /reasoning, /fast, /personality, /moa or a model change release the agent without ending the session.
+    started(provider, tmp_path).shutdown()
+    assert drained == []
+    spooled = [json.loads(p.read_text())["source"]["external_id"]
+               for p in session.Spool(tmp_path / "aeon-emerald" / "spool").pending()]
+    assert spooled == ["hermes-session:s1:0:1"]
+
+
+def test_shutdown_after_a_session_end_spools_nothing_more(provider, drained, tmp_path):
+    chat = started(provider, tmp_path)
+    chat.on_session_end(MESSAGES)
+    pending = session.Spool(tmp_path / "aeon-emerald" / "spool").pending()
+    chat.shutdown()
+    assert session.Spool(tmp_path / "aeon-emerald" / "spool").pending() == pending
+
+
 def test_a_rewind_is_not_a_departure(provider, drained, tmp_path):
     started(provider, tmp_path).on_session_switch("s1", rewound=True)
     assert drained == []
