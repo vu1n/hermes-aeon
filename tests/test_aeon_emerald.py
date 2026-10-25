@@ -41,6 +41,12 @@ def load_job(name):
     return module
 
 
+def event_stream(*messages):
+    """A server-sent event reply, the way Emerald answers a client that accepts both formats."""
+    text = "".join(f"event: message\ndata: {json.dumps(m)}\n\n" for m in messages)
+    return httpx.Response(200, text=text, headers={"content-type": "text/event-stream"})
+
+
 def mcp_server(handler):
     """A fake Emerald /mcp endpoint: ``handler(tool, arguments)`` returns structured content or raises."""
     calls = []
@@ -52,10 +58,10 @@ def mcp_server(handler):
         try:
             value = handler(params["name"], params["arguments"])
         except LookupError as error:
-            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {
+            return event_stream({"jsonrpc": "2.0", "id": body["id"], "result": {
                 "isError": True, "content": [{"type": "text", "text": str(error)}],
                 "structuredContent": {"code": "NotFound", "message": str(error)}}})
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {
+        return event_stream({"jsonrpc": "2.0", "id": body["id"], "result": {
             "content": [{"type": "text", "text": json.dumps(value)}], "structuredContent": value}})
 
     return httpx.MockTransport(respond), calls
@@ -97,11 +103,21 @@ def test_call_raises_with_tool_name_on_tool_error():
         client.Emerald("http://aeon/mcp", "k", transport=transport).call("fetch", {"id": "x"})
 
 
+def test_call_reads_plain_json_replies():
+    def reply(request):
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.loads(request.content)["id"],
+                                         "result": {"structuredContent": {"items": []}}})
+    emerald = client.Emerald("http://aeon/mcp", "k", transport=httpx.MockTransport(reply))
+    assert emerald.call("timeline", {}) == {"items": []}
+
+
 @pytest.mark.parametrize("response, pattern", [
     (httpx.Response(401, text="unauthorized"), "HTTP 401"),
     (httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "bad"}}),
      "JSON-RPC -32602"),
-    (httpx.Response(200, text="<html>"), "non-JSON"),
+    (httpx.Response(200, text="<html>"), "unreadable response"),
+    (event_stream({"jsonrpc": "2.0", "method": "notifications/message", "params": {}}),
+     "unreadable response: no reply"),
 ])
 def test_call_raises_on_transport_and_protocol_errors(response, pattern):
     emerald = client.Emerald("http://aeon/mcp", "k", transport=httpx.MockTransport(lambda r: response))

@@ -87,9 +87,9 @@ class Emerald:
         if response.status_code != 200:
             raise EmeraldError(f"{tool}: HTTP {response.status_code}: {response.text[:300]}")
         try:
-            body = response.json()
+            body = _response_message(response, request["id"])
         except ValueError as error:
-            raise EmeraldError(f"{tool}: non-JSON response: {response.text[:300]}") from error
+            raise EmeraldError(f"{tool}: unreadable response: {error}: {response.text[:300]}") from error
         if "error" in body:
             error = body["error"]
             raise EmeraldError(f"{tool}: JSON-RPC {error.get('code')}: {error.get('message')}")
@@ -111,6 +111,20 @@ class Emerald:
         return self.call("capture", capture_arguments(
             content=content, kind=kind, external_id=external_id, thread_id=thread_id,
             occurred_at=occurred_at, project=project, sensitivity=sensitivity, uri=uri))
+
+
+def _response_message(response: httpx.Response, request_id: str) -> dict[str, Any]:
+    """The JSON-RPC reply to ``request_id``. MCP servers answer with plain JSON or, when the client
+    accepts it (the spec says clients must), a server-sent event stream; Emerald does the latter."""
+    if not response.headers.get("content-type", "").startswith("text/event-stream"):
+        return response.json()
+    for event in response.text.replace("\r\n", "\n").split("\n\n"):
+        data = "\n".join(line[5:].lstrip() for line in event.split("\n") if line.startswith("data:"))
+        if data:
+            message = json.loads(data)
+            if message.get("id") == request_id:
+                return message
+    raise ValueError("no reply to this request in the event stream")
 
 
 def capture_arguments(*, content: str, kind: str, external_id: str, thread_id: Optional[str] = None,
