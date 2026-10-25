@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -283,6 +284,14 @@ def test_each_compaction_segment_is_its_own_source():
     assert compacted[0]["source"]["external_id"] == grown[0]["source"]["external_id"]
 
 
+def test_the_latest_compaction_summary_names_the_segment():
+    older = {**SUMMARY, "content": "[CONTEXT COMPACTION — REFERENCE ONLY] an older summary"}
+    question = {"role": "user", "content": "And the digest?"}
+    both = captures_of("s1", [older, {"role": "user", "content": "hi"}, SUMMARY, question])
+    latest_only = captures_of("s1", [SUMMARY, question])
+    assert both[0]["source"]["external_id"] == latest_only[0]["source"]["external_id"]
+
+
 def emerald_with(transport):
     return client.Emerald("http://aeon/mcp", "k", transport=transport)
 
@@ -357,6 +366,58 @@ def test_a_capture_another_session_end_already_sent_is_skipped(tmp_path):
     assert session.drain(OtherDrainerWins(), spool) == 0
 
 
+def test_a_capture_another_drainer_sent_while_this_one_did_is_not_an_error(tmp_path, caplog):
+    spool = session.Spool(tmp_path / "spool")
+    (only,) = spooled(spool, "s1")
+
+    class SentTwice:
+        def capture(self, arguments):  # the other drainer sends the same file and removes it first
+            (tmp_path / "spool" / f"{only['operation_id']}.json").unlink()
+            return {"status": "stored"}
+    assert session.drain(SentTwice(), spool) == 0
+    assert "unreadable" not in caplog.text and not (tmp_path / "spool" / "rejected").exists()
+
+
+def test_a_file_gone_before_it_is_read_is_skipped_quietly(tmp_path, caplog):
+    spool = session.Spool(tmp_path / "spool")
+    first, second = spooled(spool, "s1", "s2")
+    second_path = tmp_path / "spool" / f"{second['operation_id']}.json"
+
+    class OtherDrainerWins:
+        def capture(self, arguments):
+            second_path.unlink(missing_ok=True)
+            return {"status": "stored"}
+    assert session.drain(OtherDrainerWins(), spool) == 0
+    assert "unreadable" not in caplog.text
+
+
+def test_a_capture_appears_in_the_spool_only_once_fully_written(tmp_path, monkeypatch):
+    # A kill mid-write must not leave half a capture where the drain would read it.
+    spool = session.Spool(tmp_path / "spool")
+    arguments = captures_of("s1")[0]
+    final = tmp_path / "spool" / f"{arguments['operation_id']}.json"
+    visible_mid_write, real_dump = [], session.json.dump
+
+    def watching(value, handle):
+        visible_mid_write.append(final.exists())
+        real_dump(value, handle)
+    monkeypatch.setattr(session.json, "dump", watching)
+    spool.put(arguments)
+    assert visible_mid_write == [False] and json.loads(final.read_text()) == arguments
+
+
+def test_a_failed_spool_write_leaves_nothing_behind(tmp_path, monkeypatch):
+    spool = session.Spool(tmp_path / "spool")
+
+    def half_then_fail(value, handle):
+        handle.write('{"operation_id": ')
+        raise OSError("disk full")
+    monkeypatch.setattr(session.json, "dump", half_then_fail)
+    with pytest.raises(OSError, match="disk full"):
+        spool.put(captures_of("s1")[0])
+    assert spool.pending() == [] and list((tmp_path / "spool").iterdir()) == []
+
+
 def test_spooled_transcripts_are_readable_only_by_their_owner(tmp_path):
     spool = session.Spool(tmp_path / "spool")
     path = spool.put(captures_of("s1")[0])
@@ -428,6 +489,13 @@ def started(provider, tmp_path, **kwargs):
 @pytest.mark.parametrize("reason", ["resumed_other", "branched"])
 def test_a_session_left_by_resume_or_branch_is_saved_on_the_switch(provider, drained, tmp_path, reason):
     started(provider, tmp_path).on_session_switch("s2", parent_session_id="s1", reset=False, reason=reason)
+    assert drained == [["hermes-session:s1:0:1"]]
+
+
+def test_a_departed_session_is_saved_once(provider, drained, tmp_path):
+    chat = started(provider, tmp_path)
+    chat.on_session_switch("s2", reset=False, reason="resumed_other")
+    chat.on_session_switch("s3", reset=False, reason="branched")
     assert drained == [["hermes-session:s1:0:1"]]
 
 
@@ -572,6 +640,21 @@ def test_watermark_repeats_the_day_moves_on_the_next_and_never_back(tmp_path):
     assert mark.since(tomorrow + 24 * hours, 24) == 1792900501  # an empty day keeps the mark
     later = morning + 30 * 24 * hours  # after a long pause, at most MAX_FEED_LOOKBACK
     assert mark.since(later, 24) == int((later - digest.MAX_FEED_LOOKBACK).timestamp())
+
+
+def test_the_watermark_day_is_the_hosts_local_day(tmp_path, monkeypatch):
+    digest = load_job("digest_inputs")
+    monkeypatch.setenv("TZ", "Asia/Ho_Chi_Minh")  # UTC+7
+    time.tzset()
+    try:
+        mark = digest.Watermark(tmp_path / "freshrss-watermark")
+        evening = digest.datetime(2026, 10, 25, 16, tzinfo=digest.timezone.utc)  # 23:00 local, Oct 25
+        mark.advance(evening, 100, [{"crawled": 500}])
+        after_midnight = evening + digest.timedelta(hours=2)  # 01:00 local Oct 26, still Oct 25 in UTC
+        assert mark.since(after_midnight, 24) != 100  # a new local day: the mark moves on
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
 
 
 def test_an_unreadable_watermark_is_an_error(tmp_path):

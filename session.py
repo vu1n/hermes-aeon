@@ -110,9 +110,13 @@ class Spool:
         path = self._dir / f"{arguments['operation_id']}.json"
         temp = self._dir / f".{path.name}.{os.getpid()}.tmp"
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(arguments, handle)
-        os.replace(temp, path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(arguments, handle)
+            os.replace(temp, path)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
         return path
 
     def pending(self) -> list[Path]:
