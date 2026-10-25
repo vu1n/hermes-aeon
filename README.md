@@ -16,10 +16,14 @@ This repository holds the two things MCP cannot do:
     compaction summary ("0" before any), so a compacted session's later transcript never replaces
     the full one. Hermes's compaction summaries themselves are left out: the user never said them.
   - A session left with `/resume` or `/branch` (which never reaches `on_session_end`) is saved from
-    the last transcript Hermes passed to `sync_turn`. Cron runs and subagents are skipped.
-  - Every capture is written to `$HERMES_HOME/aeon-emerald/spool/` first and drained oldest first. An
-    outage stops the drain until the next session end; a capture Emerald rejects for good, or an
-    unreadable file, moves to `spool/rejected/`.
+    the last transcript Hermes passed to `sync_turn`, always under that transcript's own session. A
+    rewind drops that snapshot, so turns the user undid are never stored; a session left right after
+    a rewind, before another turn, is saved only if it is later ended. A branch saves its whole
+    transcript, inherited turns included. Cron runs and subagents are skipped.
+  - Every capture is written to `$HERMES_HOME/aeon-emerald/spool/` first and drained oldest first.
+    Only Emerald refusing a capture's content (or an unreadable file) moves it to `spool/rejected/`.
+    No reply from Emerald stops the drain; any other failure (a rotated key, FORBIDDEN, an Emerald
+    error) leaves the capture for the next session end and moves on to the next one.
 - **Cron jobs** in `jobs/`, plain MCP clients sharing `client.py`:
   - `oura_pull.py` (no-agent job): Oura daily summaries, one document per category and day
     (`oura:<category>:<day>`), health-sensitive, under a principal of its own.
