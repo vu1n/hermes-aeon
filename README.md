@@ -15,6 +15,7 @@ This repository holds the two things MCP cannot do:
   - Sources are `hermes-session:<id>:<segment>:<part>`. The segment is the session's latest
     compaction summary ("0" before any), so a compacted session's later transcript never replaces
     the full one. Hermes's compaction summaries themselves are left out: the user never said them.
+    When Hermes folds a summary into a real message, that message keeps its own words.
   - A session left with `/resume` or `/branch` (which never reaches `on_session_end`) is saved from
     the last transcript Hermes passed to `sync_turn`, always under that transcript's own session. A
     rewind drops that snapshot, so turns the user undid are never stored; a session left right after
@@ -23,10 +24,16 @@ This repository holds the two things MCP cannot do:
   - Every capture is written to `$HERMES_HOME/aeon-emerald/spool/` first and drained oldest first.
     Only Emerald refusing a capture's content (or an unreadable file) moves it to `spool/rejected/`.
     No reply from Emerald stops the drain; any other failure (a rotated key, FORBIDDEN, an Emerald
-    error) leaves the capture for the next session end and moves on to the next one.
+    error) leaves the capture for the next session end and moves on to the next one. When Hermes
+    releases an agent without ending its session (a settings change), the unsaved transcript is
+    spooled and sent at the next session end.
+  - `$HERMES_HOME/aeon-emerald/acknowledged-sessions` lists the captures Emerald acknowledged; they
+    are never sent again. Erasing an episode in Emerald also erases its replay record, so resending
+    an unchanged part would store it again.
 - **Cron jobs** in `jobs/`, plain MCP clients sharing `client.py`:
   - `oura_pull.py` (no-agent job): Oura daily summaries, one document per category and day
-    (`oura:<category>:<day>`), health-sensitive, under a principal of its own.
+    (`oura:<category>:<day>`), health-sensitive, under a principal of its own. Days Emerald
+    acknowledged are recorded in `$HERMES_HOME/aeon-emerald/acknowledged-oura` and not sent again.
   - `digest_inputs.py`: new FreshRSS items and the last day's Emerald timeline, printed for the
     digest job's prompt to summarize. FreshRSS is read only (the account is the owner's own). A
     crawl-time watermark in `$HERMES_HOME/aeon-emerald/freshrss-watermark`, passed back as `ot`,
