@@ -10,16 +10,23 @@ This repository holds the two things MCP cannot do:
 
 - **Session capture.** Hermes hands the full transcript only to a memory provider, at a real
   session end. This repository is that provider, `aeon-emerald`, and it does nothing else: each
-  ended conversation is captured as a `transcript` (`hermes-session:<id>`) under Hermes's own
-  principal, and Emerald extracts what matters. Cron runs and subagents are skipped. A capture that
-  fails waits in `$HERMES_HOME/aeon-emerald/spool/` and is re-sent at the next session end.
+  conversation is captured as a `transcript` under Hermes's own principal, dated when it ended, and
+  Emerald extracts what matters.
+  - Sources are `hermes-session:<id>:<segment>:<part>`. The segment is the session's latest
+    compaction summary ("0" before any), so a compacted session's later transcript never replaces
+    the full one. Hermes's compaction summaries themselves are left out: the user never said them.
+  - A session left with `/resume` or `/branch` (which never reaches `on_session_end`) is saved from
+    the last transcript Hermes passed to `sync_turn`. Cron runs and subagents are skipped.
+  - Every capture is written to `$HERMES_HOME/aeon-emerald/spool/` first and drained oldest first. An
+    outage stops the drain until the next session end; a capture Emerald rejects for good, or an
+    unreadable file, moves to `spool/rejected/`.
 - **Cron jobs** in `jobs/`, plain MCP clients sharing `client.py`:
   - `oura_pull.py` (no-agent job): Oura daily summaries, one document per category and day
     (`oura:<category>:<day>`), health-sensitive, under a principal of its own.
   - `digest_inputs.py`: new FreshRSS items and the last day's Emerald timeline, printed for the
-    digest job's prompt to summarize. FreshRSS is read only (the account is the owner's own); the
-    newest crawl time digested is kept in `$HERMES_HOME/aeon-emerald/freshrss-watermark` and passed
-    back as `ot`.
+    digest job's prompt to summarize. FreshRSS is read only (the account is the owner's own). A
+    crawl-time watermark in `$HERMES_HOME/aeon-emerald/freshrss-watermark`, passed back as `ot`,
+    moves once per day, so a digest Hermes re-runs after a failed model call sees the same items.
 
 ## Install
 
