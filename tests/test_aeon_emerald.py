@@ -130,7 +130,7 @@ def test_setting_prefers_environment_then_profile_env_file(tmp_path, monkeypatch
     monkeypatch.setenv("AEON_B", "from-env")
     assert client.setting("AEON_A", tmp_path) == "from-file"
     assert client.setting("AEON_B", tmp_path) == "from-env"
-    with pytest.raises(client.EmeraldError, match="AEON_C is not set"):
+    with pytest.raises(client.SettingMissing, match="AEON_C is not set"):
         client.setting("AEON_C", tmp_path)
 
 
@@ -336,6 +336,14 @@ def test_missing_password_source_is_reported(tmp_path, monkeypatch, capsys, fres
     monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
     assert digest.main([]) == 1
     assert error in capsys.readouterr().err
+
+
+def test_missing_setting_is_reported_not_raised(tmp_path, monkeypatch, capsys):
+    digest = load_job("digest_inputs")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("FRESHRSS_URL", raising=False)
+    assert digest.main([]) == 1
+    assert "SettingMissing: FRESHRSS_URL is not set" in capsys.readouterr().err
 
 
 def test_digest_reads_both_sources_and_advances_the_watermark(tmp_path, monkeypatch, capsys):

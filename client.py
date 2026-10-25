@@ -24,6 +24,10 @@ class EmeraldError(RuntimeError):
     """A failed Emerald call, with the tool name and the server's code or HTTP status in the message."""
 
 
+class SettingMissing(RuntimeError):
+    """A required setting is in neither the environment nor the profile's .env."""
+
+
 def read_env_file(path: Path) -> dict[str, str]:
     """KEY=VALUE pairs from a dotenv file; missing file -> {}."""
     values: dict[str, str] = {}
@@ -49,7 +53,7 @@ def setting(name: str, hermes_home: Path) -> str:
     Hermes scrubs secrets from cron script environments, so jobs read the profile's .env directly."""
     value = os.environ.get(name) or read_env_file(hermes_home / ".env").get(name, "")
     if not value:
-        raise EmeraldError(f"{name} is not set in the environment or {hermes_home / '.env'}")
+        raise SettingMissing(f"{name} is not set in the environment or {hermes_home / '.env'}")
     return value
 
 

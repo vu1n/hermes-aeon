@@ -26,7 +26,7 @@ from typing import Any, Optional
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from client import Emerald, EmeraldError, read_env_file, setting  # noqa: E402
+from client import Emerald, EmeraldError, SettingMissing, read_env_file, setting  # noqa: E402
 
 GREADER = "/api/greader.php"
 READING_LIST = "/reader/api/0/stream/contents/user/-/state/com.google/reading-list"
@@ -170,7 +170,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             memory = timeline_items(emerald, until - timedelta(hours=args.hours), until)
         finally:
             emerald.close()
-    except (SourceError, EmeraldError, httpx.HTTPError, OSError) as error:
+    except (SourceError, SettingMissing, EmeraldError, httpx.HTTPError, OSError) as error:
         print(f"digest inputs unavailable: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
     print(render(feeds, memory, args.hours))

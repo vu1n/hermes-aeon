@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 
-from .client import Emerald, EmeraldError, setting
+from .client import Emerald, SettingMissing, setting
 from .session import Spool, send, session_captures
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class EmeraldSessionProvider(MemoryProvider):
         try:
             setting("AEON_EMERALD_URL", get_hermes_home())
             setting(KEY_SETTING, get_hermes_home())
-        except EmeraldError:
+        except SettingMissing:
             return False
         return True
 
@@ -75,7 +75,7 @@ class EmeraldSessionProvider(MemoryProvider):
             return
         try:
             client = Emerald.from_settings(self._home, KEY_SETTING)
-        except EmeraldError as error:
+        except SettingMissing as error:
             for arguments in captures:
                 spool.put(arguments)
             logger.error("aeon-emerald: session %s not captured, %d part(s) spooled: %s",
