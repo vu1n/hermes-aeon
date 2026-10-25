@@ -363,9 +363,11 @@ def test_the_ledger_remembers_acknowledged_operations_privately(tmp_path):
 
 
 def spooled(spool, *session_ids):
+    """Spool one capture per session, oldest first whatever the filesystem's timestamp resolution."""
     captures = [captures_of(sid)[0] for sid in session_ids]
-    for arguments in captures:
-        spool.put(arguments)
+    for age, arguments in enumerate(captures):
+        path = spool.put(arguments)
+        os.utime(path, ns=(10**18 + age * 10**9, 10**18 + age * 10**9))
     return captures
 
 
