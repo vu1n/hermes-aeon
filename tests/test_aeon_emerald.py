@@ -2,6 +2,7 @@
 import importlib
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -247,20 +248,78 @@ def test_session_captures_name_parts_and_thread_by_session():
     assert ids == ["hermes-session:s2:part1", "hermes-session:s2:part2"]
 
 
-def test_failed_captures_are_spooled_and_sent_on_a_later_session_end(tmp_path):
+def emerald_with(transport):
+    return client.Emerald("http://aeon/mcp", "k", transport=transport)
+
+
+def spooled(spool, *session_ids):
+    captures = [session.session_captures(sid, MESSAGES)[0] for sid in session_ids]
+    for arguments in captures:
+        spool.put(arguments)
+    return captures
+
+
+def test_spooled_captures_wait_out_an_outage_and_are_sent_later(tmp_path):
     spool = session.Spool(tmp_path / "spool")
-    captures = session.session_captures("s1", MESSAGES)
-
-    def down(tool, args):
-        raise LookupError("unavailable")
-    transport, _ = mcp_server(down)
-    assert session.send(client.Emerald("http://aeon/mcp", "k", transport=transport), spool, captures) == 1
-    assert [p.stem for p in spool.pending()] == [captures[0]["operation_id"]]
-
+    captures = spooled(spool, "s1")
+    assert session.drain(emerald_with(httpx.MockTransport(_connect_error)), spool) == 1
     transport, calls = mcp_server(stored)
-    assert session.send(client.Emerald("http://aeon/mcp", "k", transport=transport), spool, []) == 0
-    assert spool.pending() == []
-    assert calls[0][1] == captures[0]
+    assert session.drain(emerald_with(transport), spool) == 0
+    assert [c[1] for c in calls] == captures
+
+
+def test_an_outage_ends_the_drain_after_one_try(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    spooled(spool, "s1", "s2", "s3")
+    tries = []
+
+    def unreachable(request):
+        tries.append(request)
+        return _connect_error(request)
+    assert session.drain(emerald_with(httpx.MockTransport(unreachable)), spool) == 3
+    assert len(tries) == 1
+
+
+def test_the_spool_drains_oldest_first(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    captures = spooled(spool, "s1", "s2", "s3")
+    for age, arguments in zip((3, 1, 2), captures):  # s1 oldest, then s3, then s2
+        path = tmp_path / "spool" / f"{arguments['operation_id']}.json"
+        os.utime(path, ns=(10**18 - age * 10**9, 10**18 - age * 10**9))
+    transport, calls = mcp_server(stored)
+    session.drain(emerald_with(transport), spool)
+    assert [c[1]["thread_id"] for c in calls] == ["s1", "s3", "s2"]
+
+
+def test_a_capture_emerald_rejects_leaves_the_retry_loop(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    spooled(spool, "s1")
+    transport, _ = mcp_server(lambda tool, args: {"status": "rejected_sensitive", "reason": "not opted in"})
+    assert session.drain(emerald_with(transport), spool) == 0
+    assert len(list((tmp_path / "spool" / "rejected").glob("*.json"))) == 1
+
+
+def test_an_unreadable_spool_file_is_set_aside_and_the_rest_still_sent(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    (tmp_path / "spool").mkdir()
+    (tmp_path / "spool" / "half-written.json").write_text('{"operation_id": ')
+    captures = spooled(spool, "s1")
+    transport, calls = mcp_server(stored)
+    assert session.drain(emerald_with(transport), spool) == 0
+    assert [c[1] for c in calls] == captures
+    assert (tmp_path / "spool" / "rejected" / "half-written.json").exists()
+
+
+def test_a_capture_another_session_end_already_sent_is_skipped(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    first, second = spooled(spool, "s1", "s2")
+    second_path = tmp_path / "spool" / f"{second['operation_id']}.json"
+
+    class OtherDrainerWins:
+        def capture(self, arguments):  # while s1 is sent, another session end sends and removes s2
+            second_path.unlink()
+            return {"status": "stored"}
+    assert session.drain(OtherDrainerWins(), spool) == 0
 
 
 def test_spooled_transcripts_are_readable_only_by_their_owner(tmp_path):
@@ -268,26 +327,36 @@ def test_spooled_transcripts_are_readable_only_by_their_owner(tmp_path):
     path = spool.put(session.session_captures("s1", MESSAGES)[0])
     assert path.stat().st_mode & 0o777 == 0o600
     assert (tmp_path / "spool").stat().st_mode & 0o777 == 0o700
+    assert [p.name for p in (tmp_path / "spool").iterdir()] == [path.name]  # no temp file left behind
 
 
 # -- provider ---------------------------------------------------------------------------------------------
 
-def test_provider_captures_primary_sessions_only(provider, tmp_path, monkeypatch):
-    sent = []
+@pytest.fixture
+def drained(provider, monkeypatch):
+    """Record, at each drain, the external ids waiting in the spool; the drain then sends nothing."""
+    seen = []
     monkeypatch.setattr(provider.Emerald, "from_settings", classmethod(lambda cls, home, key: object.__new__(cls)))
     monkeypatch.setattr(provider.Emerald, "close", lambda self: None)
-    monkeypatch.setattr(provider, "send", lambda c, spool, captures: sent.append(captures) or 0)
 
+    def drain(emerald, spool):
+        seen.append([json.loads(p.read_text())["source"]["external_id"] for p in spool.pending()])
+        return len(spool.pending())
+    monkeypatch.setattr(provider, "drain", drain)
+    return seen
+
+
+def test_provider_captures_primary_sessions_only(provider, drained, tmp_path):
     cron = provider.EmeraldSessionProvider()
     cron.initialize("s-cron", hermes_home=str(tmp_path), platform="cron", agent_context="cron")
     cron.on_session_end(MESSAGES)
-    assert sent == []
+    assert drained == []
 
     chat = provider.EmeraldSessionProvider()
     chat.initialize("s1", hermes_home=str(tmp_path), platform="telegram")
     chat.on_session_switch("s2")
     chat.on_session_end(MESSAGES)
-    assert [c["source"]["external_id"] for c in sent[0]] == ["hermes-session:s2"]
+    assert drained == [["hermes-session:s2"]]
     assert chat.get_tool_schemas() == []
 
 
@@ -300,32 +369,18 @@ def test_provider_spools_when_settings_are_missing(provider, tmp_path):
 
 def test_provider_is_available_only_with_url_and_key(provider, tmp_path, monkeypatch):
     monkeypatch.setattr(provider, "get_hermes_home", lambda: tmp_path)
-    for name in ("AEON_EMERALD_URL", "AEON_EMERALD_KEY"):
-        monkeypatch.delenv(name, raising=False)
     (tmp_path / ".env").write_text("AEON_EMERALD_URL=http://aeon/mcp\n")
     assert not provider.EmeraldSessionProvider().is_available()
     (tmp_path / ".env").write_text("AEON_EMERALD_URL=http://aeon/mcp\nAEON_EMERALD_KEY=k\n")
     assert provider.EmeraldSessionProvider().is_available()
 
 
-def test_provider_resends_the_spool_at_a_session_end_with_nothing_new(provider, tmp_path, monkeypatch):
+def test_provider_resends_the_spool_at_a_session_end_with_nothing_new(provider, drained, tmp_path):
     session.Spool(tmp_path / "aeon-emerald" / "spool").put(session.session_captures("old", MESSAGES)[0])
-    sent = []
-    monkeypatch.setattr(provider.Emerald, "from_settings", classmethod(lambda cls, home, key: object.__new__(cls)))
-    monkeypatch.setattr(provider.Emerald, "close", lambda self: None)
-    monkeypatch.setattr(provider, "send", lambda c, spool, captures: sent.append(captures) or 0)
     chat = provider.EmeraldSessionProvider()
     chat.initialize("s1", hermes_home=str(tmp_path), platform="telegram")
     chat.on_session_end([{"role": "assistant", "content": "Good morning"}])
-    assert sent == [[]]
-
-
-def test_a_rejected_spooled_capture_stays_in_the_spool(tmp_path):
-    spool = session.Spool(tmp_path / "spool")
-    spool.put(session.session_captures("s1", MESSAGES)[0])
-    transport, _ = mcp_server(lambda tool, args: {"status": "rejected_sensitive", "reason": "not opted in"})
-    assert session.send(client.Emerald("http://aeon/mcp", "k", transport=transport), spool, []) == 1
-    assert len(spool.pending()) == 1
+    assert drained == [["hermes-session:old"]]
 
 
 # -- oura job ---------------------------------------------------------------------------------------------

@@ -14,7 +14,7 @@ from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 
 from .client import Emerald, SettingMissing, setting
-from .session import Spool, send, session_captures
+from .session import Spool, drain, session_captures
 
 logger = logging.getLogger(__name__)
 
@@ -70,20 +70,21 @@ class EmeraldSessionProvider(MemoryProvider):
         if not self._writes:
             return
         captures = session_captures(self._session_id, messages or [], platform=self._platform or None)
-        spool = Spool(self._home / "aeon-emerald" / "spool")
-        if not captures and not spool.pending():
+        spool_dir = self._home / "aeon-emerald" / "spool"
+        spool = Spool(spool_dir)
+        # Spool first: an outage, a crash or an interrupted send then loses nothing.
+        for arguments in captures:
+            spool.put(arguments)
+        if not spool.pending():
             return
         try:
             client = Emerald.from_settings(self._home, KEY_SETTING)
         except SettingMissing as error:
-            for arguments in captures:
-                spool.put(arguments)
-            logger.error("aeon-emerald: session %s not captured, %d part(s) spooled: %s",
-                         self._session_id, len(captures), error)
+            logger.error("aeon-emerald: session %s not sent, captures wait in %s: %s", self._session_id, spool_dir, error)
             return
         try:
-            failed = send(client, spool, captures)
+            waiting = drain(client, spool)
         finally:
             client.close()
-        if not failed:
+        if captures and not waiting:
             logger.info("aeon-emerald: captured session %s (%d part(s))", self._session_id, len(captures))
