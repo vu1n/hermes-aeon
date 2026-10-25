@@ -79,6 +79,30 @@ def content_version(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
+class Ledger:
+    """Operation ids Emerald has acknowledged, so unchanged content is never sent again.
+
+    Emerald replays a re-sent operation from its own record, but erasing an episode (``forget``) deletes
+    that record too: content re-sent after an erasure would be stored again. One id per line, appended
+    with O_APPEND, so writers in several processes do not interleave."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def __contains__(self, operation_id: str) -> bool:
+        try:
+            with self._path.open(encoding="utf-8") as handle:
+                return any(line.rstrip("\n") == operation_id for line in handle)
+        except FileNotFoundError:
+            return False
+
+    def add(self, operation_id: str) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(operation_id + "\n")
+
+
 class Emerald:
     def __init__(self, url: str, key: str, *, timeout: float = 20.0,
                  transport: Optional[httpx.BaseTransport] = None) -> None:

@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .client import Emerald, EmeraldError, capture_arguments
+from .client import Emerald, EmeraldError, Ledger, capture_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +19,14 @@ logger = logging.getLogger(__name__)
 PART_LIMIT = 90_000
 _SPEAKERS = {"user": "User", "assistant": "Hermes"}
 # Hermes marks the summary it inserts when it compacts a long context (agent/context_compressor.py) with
-# this key, and starts its text with one of these prefixes (current and historical).
+# this key, and starts the summary with one of these prefixes (current and historical). When no message of
+# its own fits, it folds the summary into a real message: after that message's text, between the PRIOR
+# CONTEXT header and delimiter, or before it, ending with the end marker.
 COMPACTION_FLAG = "_compressed_summary"
 COMPACTION_PREFIXES = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:")
+SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
+PRIOR_CONTEXT_END = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
 
 
 def _text(content: Any) -> str:
@@ -32,20 +37,28 @@ def _text(content: Any) -> str:
     return content.replace("\x00", "").strip() if isinstance(content, str) else ""
 
 
-def _compaction_summary(message: dict[str, Any]) -> Optional[str]:
+def _split_compaction(message: dict[str, Any]) -> tuple[Optional[str], str]:
+    """(compaction summary or None, the message's own text)."""
     text = _text(message.get("content"))
-    return text if message.get(COMPACTION_FLAG) or text.startswith(COMPACTION_PREFIXES) else None
+    merged_after = text.startswith(PRIOR_CONTEXT_HEADER) and PRIOR_CONTEXT_END in text
+    if not (message.get(COMPACTION_FLAG) or text.startswith(COMPACTION_PREFIXES) or merged_after):
+        return None, text
+    if merged_after:
+        own, _, summary = text[len(PRIOR_CONTEXT_HEADER):].partition(PRIOR_CONTEXT_END)
+        return summary.replace(SUMMARY_END, "").strip(), own.strip()
+    summary, _, own = text.partition(SUMMARY_END)
+    return summary.strip(), own.strip()
 
 
 def transcript_turns(messages: Iterable[dict[str, Any]]) -> list[str]:
     """What the user and Hermes said, in order. Left out: system messages, tool calls and results (bulky,
     and Emerald's extraction should work from what was said), and compaction summaries, which Hermes
-    writes and inserts as a user message although the user never said them."""
+    writes although the user never said them; a message the summary was folded into keeps its own text."""
     turns = []
     for message in messages:
         speaker = _SPEAKERS.get(message.get("role", ""))
-        text = _text(message.get("content"))
-        if speaker and text and _compaction_summary(message) is None:
+        _, text = _split_compaction(message)
+        if speaker and text:
             turns.append(f"{speaker}: {text}")
     return turns
 
@@ -80,12 +93,12 @@ def session_captures(session_id: str, messages: Iterable[dict[str, Any]], *, end
     under the same id with the summary and the turns since. Without the segment, that later transcript
     would be stored as a newer revision of the full one and outrank it. A session that only grows keeps
     its segment, so its newer transcript does replace the older one. Parts are numbered without a total,
-    so growth re-sends only the last part."""
+    so a grown session changes only its last part (the ledger keeps the rest from being re-sent)."""
     messages = list(messages)
     turns = transcript_turns(messages)
     if not any(turn.startswith("User: ") for turn in turns):
         return []
-    summaries = [summary for message in messages if (summary := _compaction_summary(message)) is not None]
+    summaries = [summary for message in messages if (summary := _split_compaction(message)[0]) is not None]
     segment = hashlib.sha256(summaries[-1].encode("utf-8")).hexdigest()[:12] if summaries else "0"
     header = f"Hermes session {session_id}" + (f" ({platform})" if platform else "")
     return [capture_arguments(content=f"{header}, part {index}\n\n{part}", kind="transcript",
@@ -98,7 +111,7 @@ class Spool:
     """Captures on their way to Emerald, one JSON file each, written before any send is tried.
 
     Several session ends may drain the same spool at once (gateway chats, the CLI): each file is sent
-    and removed independently, and a re-send is harmless because Emerald replays the first receipt."""
+    and removed independently; a capture two drainers both send is replayed by Emerald, not stored twice."""
 
     def __init__(self, directory: Path) -> None:
         self._dir = directory
@@ -141,10 +154,11 @@ class Spool:
         return rejected / path.name
 
 
-def drain(client: Emerald, spool: Spool) -> int:
+def drain(client: Emerald, spool: Spool, ledger: Ledger) -> int:
     """Send spooled captures, oldest first, and return how many are still waiting.
 
-    Only a refusal of the capture's own content (or a file that cannot be read) moves it to ``rejected/``.
+    A capture the ledger shows Emerald already acknowledged is dropped unsent: the unchanged parts of a
+    grown session, which re-sent after the owner erased them would be stored again. Only a refusal of the capture's own content (or a file that cannot be read) moves it to ``rejected/``.
     Any other failure leaves it to be resent at a later session end: a 401 after a key rotation, or an
     Emerald database blip, must not sweep the backlog aside. No reply at all ends the drain, since the
     rest would each wait out the same timeout; any other failure moves on to the next capture, so one
@@ -159,6 +173,9 @@ def drain(client: Emerald, spool: Spool) -> int:
             logger.error("aeon-emerald: unreadable spooled capture %s moved to %s: %s",
                          path.name, spool.reject(path), error)
             continue
+        if arguments["operation_id"] in ledger:
+            path.unlink(missing_ok=True)
+            continue
         try:
             client.capture(arguments)
         except EmeraldError as error:
@@ -171,5 +188,6 @@ def drain(client: Emerald, spool: Spool) -> int:
             else:
                 logger.error("aeon-emerald: capture of %s failed, left in the spool: %s", external_id, error)
             continue
+        ledger.add(arguments["operation_id"])
         path.unlink(missing_ok=True)
     return len(spool.pending())

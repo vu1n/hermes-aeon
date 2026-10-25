@@ -280,6 +280,22 @@ def test_sessions_without_user_text_are_not_captured():
     assert captures_of("s1", [{"role": "assistant", "content": "Good morning"}]) == []
 
 
+SUMMARY_TEXT = "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted. ## Goal: move Hermes"
+
+
+@pytest.mark.parametrize("merged", [
+    session.PRIOR_CONTEXT_HEADER + "\nAnd the digest?\n\n" + session.PRIOR_CONTEXT_END + "\n\n" + SUMMARY_TEXT
+    + "\n\n" + session.SUMMARY_END,
+    SUMMARY_TEXT + "\n\n" + session.SUMMARY_END + "\n\nAnd the digest?",
+], ids=["summary-after-the-message", "summary-before-the-message"])
+def test_a_summary_folded_into_a_message_keeps_the_messages_own_words(merged):
+    folded = {"role": "user", "content": merged, "_compressed_summary": True}
+    assert session.transcript_turns([folded]) == ["User: And the digest?"]
+    standalone = [{**SUMMARY, "content": SUMMARY_TEXT}, {"role": "user", "content": "And the digest?"}]
+    assert captures_of("s1", [folded])[0]["source"]["external_id"] == \
+        captures_of("s1", standalone)[0]["source"]["external_id"]
+
+
 def test_long_transcripts_split_at_turn_boundaries_and_oversized_turns_are_cut():
     turns = [f"User: {'a' * 40}", f"Hermes: {'b' * 40}", f"User: {'c' * 130}"]
     parts = session.transcript_parts(turns, limit=100)
@@ -329,8 +345,21 @@ def test_the_latest_compaction_summary_names_the_segment():
     assert both[0]["source"]["external_id"] == latest_only[0]["source"]["external_id"]
 
 
+def ledger_at(tmp_path):
+    return client.Ledger(tmp_path / "acknowledged")
+
+
 def emerald_with(transport):
     return client.Emerald("http://aeon/mcp", "k", transport=transport)
+
+
+def test_the_ledger_remembers_acknowledged_operations_privately(tmp_path):
+    ledger = client.Ledger(tmp_path / "state" / "acknowledged")
+    assert "op-1" not in ledger
+    ledger.add("op-1")
+    ledger.add("op-2")
+    assert "op-1" in ledger and "op-2" in ledger and "op-" not in ledger
+    assert (tmp_path / "state" / "acknowledged").stat().st_mode & 0o777 == 0o600
 
 
 def spooled(spool, *session_ids):
@@ -343,10 +372,22 @@ def spooled(spool, *session_ids):
 def test_spooled_captures_wait_out_an_outage_and_are_sent_later(tmp_path):
     spool = session.Spool(tmp_path / "spool")
     captures = spooled(spool, "s1")
-    assert session.drain(emerald_with(httpx.MockTransport(_connect_error)), spool) == 1
+    assert session.drain(emerald_with(httpx.MockTransport(_connect_error)), spool, ledger_at(tmp_path)) == 1
     transport, calls = mcp_server(stored)
-    assert session.drain(emerald_with(transport), spool) == 0
+    assert session.drain(emerald_with(transport), spool, ledger_at(tmp_path)) == 0
     assert [c[1] for c in calls] == captures
+
+
+def test_a_capture_emerald_acknowledged_is_never_sent_again(tmp_path):
+    # Emerald forgets an operation when its episode is erased; re-sent, the content would be stored again.
+    spool = session.Spool(tmp_path / "spool")
+    captures = spooled(spool, "s1")
+    transport, calls = mcp_server(stored)
+    session.drain(emerald_with(transport), spool, ledger_at(tmp_path))
+    assert captures[0]["operation_id"] in ledger_at(tmp_path)
+    spooled(spool, "s1")  # the same, unchanged part saved again
+    assert session.drain(emerald_with(transport), spool, ledger_at(tmp_path)) == 0
+    assert len(calls) == 1
 
 
 def test_an_outage_ends_the_drain_after_one_try(tmp_path):
@@ -357,7 +398,7 @@ def test_an_outage_ends_the_drain_after_one_try(tmp_path):
     def unreachable(request):
         tries.append(request)
         return _connect_error(request)
-    assert session.drain(emerald_with(httpx.MockTransport(unreachable)), spool) == 3
+    assert session.drain(emerald_with(httpx.MockTransport(unreachable)), spool, ledger_at(tmp_path)) == 3
     assert len(tries) == 1
 
 
@@ -373,7 +414,7 @@ def test_an_endpoint_or_credential_failure_keeps_every_capture(tmp_path, failure
     def failing(request):
         tries.append(request)
         return failure(request)
-    assert session.drain(emerald_with(httpx.MockTransport(failing)), spool) == 3
+    assert session.drain(emerald_with(httpx.MockTransport(failing)), spool, ledger_at(tmp_path)) == 3
     assert len(tries) == 3 and not (tmp_path / "spool" / "rejected").exists()
 
 
@@ -386,7 +427,7 @@ def test_a_capture_emerald_keeps_failing_does_not_hold_back_the_rest(tmp_path):
             raise ToolFailure("UNAVAILABLE", "invalid byte sequence")
         return stored(tool, args)
     transport, calls = mcp_server(capture)
-    assert session.drain(emerald_with(transport), spool) == 1
+    assert session.drain(emerald_with(transport), spool, ledger_at(tmp_path)) == 1
     assert sorted(c[1]["thread_id"] for c in calls) == ["s1", "s2", "s3"]
     assert [json.loads(p.read_text())["thread_id"] for p in spool.pending()] == ["s1"]
 
@@ -398,7 +439,7 @@ def test_the_spool_drains_oldest_first(tmp_path):
         path = tmp_path / "spool" / f"{arguments['operation_id']}.json"
         os.utime(path, ns=(10**18 - age * 10**9, 10**18 - age * 10**9))
     transport, calls = mcp_server(stored)
-    session.drain(emerald_with(transport), spool)
+    session.drain(emerald_with(transport), spool, ledger_at(tmp_path))
     assert [c[1]["thread_id"] for c in calls] == ["s1", "s3", "s2"]
 
 
@@ -406,7 +447,7 @@ def test_a_capture_emerald_rejects_leaves_the_retry_loop(tmp_path):
     spool = session.Spool(tmp_path / "spool")
     spooled(spool, "s1")
     transport, _ = mcp_server(lambda tool, args: {"status": "rejected_sensitive", "reason": "not opted in"})
-    assert session.drain(emerald_with(transport), spool) == 0
+    assert session.drain(emerald_with(transport), spool, ledger_at(tmp_path)) == 0
     assert len(list((tmp_path / "spool" / "rejected").glob("*.json"))) == 1
 
 
@@ -416,7 +457,7 @@ def test_an_unreadable_spool_file_is_set_aside_and_the_rest_still_sent(tmp_path)
     (tmp_path / "spool" / "half-written.json").write_text('{"operation_id": ')
     captures = spooled(spool, "s1")
     transport, calls = mcp_server(stored)
-    assert session.drain(emerald_with(transport), spool) == 0
+    assert session.drain(emerald_with(transport), spool, ledger_at(tmp_path)) == 0
     assert [c[1] for c in calls] == captures
     assert (tmp_path / "spool" / "rejected" / "half-written.json").exists()
 
@@ -430,7 +471,7 @@ def test_a_capture_another_session_end_already_sent_is_skipped(tmp_path):
         def capture(self, arguments):  # while s1 is sent, another session end sends and removes s2
             second_path.unlink()
             return {"status": "stored"}
-    assert session.drain(OtherDrainerWins(), spool) == 0
+    assert session.drain(OtherDrainerWins(), spool, ledger_at(tmp_path)) == 0
 
 
 def test_a_capture_another_drainer_sent_while_this_one_did_is_not_an_error(tmp_path, caplog):
@@ -441,7 +482,7 @@ def test_a_capture_another_drainer_sent_while_this_one_did_is_not_an_error(tmp_p
         def capture(self, arguments):  # the other drainer sends the same file and removes it first
             (tmp_path / "spool" / f"{only['operation_id']}.json").unlink()
             return {"status": "stored"}
-    assert session.drain(SentTwice(), spool) == 0
+    assert session.drain(SentTwice(), spool, ledger_at(tmp_path)) == 0
     assert "unreadable" not in caplog.text and not (tmp_path / "spool" / "rejected").exists()
 
 
@@ -454,7 +495,7 @@ def test_a_file_gone_before_it_is_read_is_skipped_quietly(tmp_path, caplog):
         def capture(self, arguments):
             second_path.unlink(missing_ok=True)
             return {"status": "stored"}
-    assert session.drain(OtherDrainerWins(), spool) == 0
+    assert session.drain(OtherDrainerWins(), spool, ledger_at(tmp_path)) == 0
     assert "unreadable" not in caplog.text
 
 
@@ -502,7 +543,7 @@ def drained(provider, monkeypatch):
     monkeypatch.setattr(provider.Emerald, "from_settings", classmethod(lambda cls, home, key: object.__new__(cls)))
     monkeypatch.setattr(provider.Emerald, "close", lambda self: None)
 
-    def drain(emerald, spool):
+    def drain(emerald, spool, ledger):
         seen.append([json.loads(p.read_text())["source"]["external_id"] for p in spool.pending()])
         return len(spool.pending())
     monkeypatch.setattr(provider, "drain", drain)
@@ -591,12 +632,26 @@ def test_a_late_turn_of_a_departed_session_is_saved_when_the_next_one_ends(provi
     assert sorted(drained[0]) == ["hermes-session:s1:0:1", "hermes-session:s2:0:1"]
 
 
+
+def test_a_late_snapshot_is_dated_by_its_own_turn(provider, tmp_path, monkeypatch):
+    times = iter(["2026-10-25T08:00:00+00:00", "2026-10-25T09:00:00+00:00"])
+    monkeypatch.setattr(provider, "_now", lambda: next(times))
+    chat = provider.EmeraldSessionProvider()
+    chat.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+    chat.on_session_switch("s2", reset=False, reason="resumed_other")
+    chat.sync_turn("q", "a", session_id="s1", messages=MESSAGES)  # 08:00, s1's last turn
+    chat.on_session_end([{"role": "user", "content": "s2 ends"}])  # 09:00
+    dated = {json.loads(p.read_text())["thread_id"]: json.loads(p.read_text())["occurred_at"]
+             for p in session.Spool(tmp_path / "aeon-emerald" / "spool").pending()}
+    assert dated == {"s1": "2026-10-25T08:00:00+00:00", "s2": "2026-10-25T09:00:00+00:00"}
+
+
 def test_a_failed_save_on_switch_still_moves_to_the_new_session(provider, tmp_path, monkeypatch):
     monkeypatch.setattr(provider.Emerald, "from_settings", classmethod(lambda cls, home, key: object.__new__(cls)))
     monkeypatch.setattr(provider.Emerald, "close", lambda self: None)
     seen = []
 
-    def drain(emerald, spool):
+    def drain(emerald, spool, ledger):
         seen.append(sorted(json.loads(p.read_text())["thread_id"] for p in spool.pending()))
         if len(seen) == 1:
             raise OSError("disk full")
@@ -660,7 +715,7 @@ def test_sleep_renders_what_a_daily_sleep_row_has():
                                       "contributors: {'deep_sleep': 70, 'rem_sleep': 90}")
 
 
-def test_oura_run_reports_fetch_and_capture_failures():
+def test_oura_run_reports_fetch_and_capture_failures(tmp_path):
     oura = load_job("oura_pull")
 
     def api(request):
@@ -679,11 +734,26 @@ def test_oura_run_reports_fetch_and_capture_failures():
         return stored(tool, args)
     transport, calls = mcp_server(capture)
     summary = oura.run(oura.Emerald("http://aeon/mcp", "k", transport=transport),
-                       httpx.Client(transport=httpx.MockTransport(api)), days=3, today="2026-10-25")
+                       httpx.Client(transport=httpx.MockTransport(api)), days=3,
+                       ledger=oura.Ledger(tmp_path / "acknowledged"), today="2026-10-25")
     assert summary["window"] == ["2026-10-22", "2026-10-25"]
     assert summary["sent"] == {"sleep": 1, "readiness": 0, "workout": 0}
     assert [e.split(": ")[0] for e in summary["errors"]] == ["capture oura:sleep:2026-10-24", "fetch daily_activity"]
     assert [c[1]["source"]["external_id"] for c in calls] == ["oura:sleep:2026-10-23", "oura:sleep:2026-10-24"]
+
+
+
+def test_oura_does_not_resend_a_day_emerald_acknowledged(tmp_path):
+    oura = load_job("oura_pull")
+    day = {"data": [{"day": "2026-10-24", "score": 82}]}
+    api = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, json=day if r.url.path.endswith("daily_sleep") else {"data": []})))
+    transport, calls = mcp_server(stored)
+    ledger = oura.Ledger(tmp_path / "acknowledged")
+    first = oura.run(oura.Emerald("http://aeon/mcp", "k", transport=transport), api, 3, ledger, today="2026-10-25")
+    again = oura.run(oura.Emerald("http://aeon/mcp", "k", transport=transport), api, 3, ledger, today="2026-10-25")
+    assert first["sent"]["sleep"] == 1 and again["sent"]["sleep"] == 0 and again["unchanged"] == 1
+    assert len(calls) == 1
 
 
 def test_oura_main_exits_1_when_anything_failed(tmp_path, monkeypatch, capsys):
@@ -691,7 +761,7 @@ def test_oura_main_exits_1_when_anything_failed(tmp_path, monkeypatch, capsys):
     (tmp_path / ".env").write_text("AEON_EMERALD_URL=http://aeon/mcp\nAEON_EMERALD_OURA_KEY=k\nOURA_PAT=t\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     for errors, status in (([], 0), (["fetch daily_sleep: boom"], 1)):
-        monkeypatch.setattr(oura, "run", lambda emerald, http, days, errors=errors: {"errors": errors})
+        monkeypatch.setattr(oura, "run", lambda emerald, http, days, ledger, errors=errors: {"errors": errors})
         assert oura.main([]) == status
     assert '"errors": ["fetch daily_sleep: boom"]' in capsys.readouterr().out
 

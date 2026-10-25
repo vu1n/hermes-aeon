@@ -1,7 +1,8 @@
 """Hermes cron script (no agent): pull Oura daily summaries into Aeon Emerald.
 
 Each day and category is one source document (``oura:<category>:<day>``). Oura revises the current
-day as it syncs, so each change is a new version; an unchanged day replays its first receipt.
+day as it syncs, so each change is a new version; an unchanged day Emerald already acknowledged is not
+sent again (see ``Ledger``), so a day the owner erased does not come back.
 Prints a JSON summary; exits 1 if any category failed to fetch or any capture failed.
 
     oura_pull.py [--days N]
@@ -19,7 +20,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from client import Emerald, EmeraldError, capture_arguments, setting  # noqa: E402
+from client import Emerald, EmeraldError, Ledger, capture_arguments, setting  # noqa: E402
 
 OURA_API = "https://api.ouraring.com/v2/usercollection"
 KEY_SETTING = "AEON_EMERALD_OURA_KEY"
@@ -103,10 +104,11 @@ def episode(label: str, row: dict, render: Callable[[dict], str]) -> Optional[di
                              occurred_at=occurred_at, project="health", sensitivity=["health"])
 
 
-def run(emerald: Emerald, oura: httpx.Client, days: int, today: Optional[str] = None) -> dict[str, Any]:
+def run(emerald: Emerald, oura: httpx.Client, days: int, ledger: Ledger,
+        today: Optional[str] = None) -> dict[str, Any]:
     end = datetime.fromisoformat(today).date() if today else datetime.now(timezone.utc).date()
     start = (end - timedelta(days=days)).isoformat()
-    summary: dict[str, Any] = {"window": [start, end.isoformat()], "sent": {}, "errors": []}
+    summary: dict[str, Any] = {"window": [start, end.isoformat()], "sent": {}, "unchanged": 0, "errors": []}
     for endpoint, label, render in CATEGORIES:
         try:
             rows = fetch(oura, endpoint, start, end.isoformat())
@@ -118,11 +120,15 @@ def run(emerald: Emerald, oura: httpx.Client, days: int, today: Optional[str] = 
             arguments = episode(label, row, render)
             if arguments is None:
                 continue
+            if arguments["operation_id"] in ledger:
+                summary["unchanged"] += 1
+                continue
             try:
                 emerald.capture(arguments)
             except EmeraldError as error:
                 summary["errors"].append(f"capture {arguments['source']['external_id']}: {error}")
                 continue
+            ledger.add(arguments["operation_id"])
             sent += 1
         summary["sent"][label] = sent
     return summary
@@ -136,7 +142,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     emerald = Emerald.from_settings(home, KEY_SETTING)
     oura = httpx.Client(timeout=30.0, headers={"Authorization": f"Bearer {setting('OURA_PAT', home)}"})
     try:
-        summary = run(emerald, oura, args.days)
+        summary = run(emerald, oura, args.days, Ledger(home / "aeon-emerald" / "acknowledged-oura"))
     finally:
         emerald.close()
         oura.close()

@@ -14,10 +14,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 
-from .client import Emerald, SettingMissing, setting
+from .client import Emerald, Ledger, SettingMissing, setting
 from .session import Spool, drain, session_captures
 
 logger = logging.getLogger(__name__)
+
+Saved = Tuple[str, List[Dict[str, Any]], str]  # session id, transcript, when it ended (ISO 8601, UTC)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 KEY_SETTING = "AEON_EMERALD_KEY"
 PROMPT = (
@@ -35,8 +41,8 @@ class EmeraldSessionProvider(MemoryProvider):
         self._session_id = ""
         self._platform = ""
         self._writes = False
-        # (session id, transcript) as of the last turn, until that session is saved.
-        self._latest: Optional[Tuple[str, List[Dict[str, Any]]]] = None
+        # (session id, transcript, when) as of the last turn, until that session is saved.
+        self._latest: Optional[Saved] = None
 
     @property
     def name(self) -> str:
@@ -71,7 +77,7 @@ class EmeraldSessionProvider(MemoryProvider):
         # Hermes passes the redacted transcript after each turn, off the main thread, so it can arrive
         # after a switch: it keeps the id of the session it belongs to.
         if messages is not None:
-            self._latest = (session_id or self._session_id, list(messages))
+            self._latest = (session_id or self._session_id, list(messages), _now())
 
     def on_session_switch(self, new_session_id: str, **kwargs: Any) -> None:
         # /resume and /branch leave a session without on_session_end; /new and compaction end it first,
@@ -87,7 +93,7 @@ class EmeraldSessionProvider(MemoryProvider):
         snapshot, self._latest = self._latest, None
         # A late turn of a session already left still belongs to that session.
         stale = [snapshot] if snapshot and snapshot[0] != self._session_id else []
-        self._save([*stale, (self._session_id, messages)])
+        self._save([*stale, (self._session_id, messages, _now())])
 
     def shutdown(self) -> None:
         # Hermes also releases an agent without ending its session (a /reasoning, /fast, /personality,
@@ -97,15 +103,15 @@ class EmeraldSessionProvider(MemoryProvider):
         if snapshot:
             self._save([snapshot], send=False)
 
-    def _save(self, sessions: List[Tuple[str, List[Dict[str, Any]]]], *, send: bool = True) -> None:
+    def _save(self, sessions: List[Saved], *, send: bool = True) -> None:
+        """Spool each (session id, transcript, when it ended), then send unless ``send`` is false."""
         if not self._writes:
             return
-        ended_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         spool_dir = self._home / "aeon-emerald" / "spool"
         spool = Spool(spool_dir)
         # Spool first: an outage, a crash or an interrupted send then loses nothing.
         captured = []
-        for session_id, messages in sessions:
+        for session_id, messages, ended_at in sessions:
             captures = session_captures(session_id, messages or [], ended_at=ended_at,
                                         platform=self._platform or None)
             for arguments in captures:
@@ -119,7 +125,7 @@ class EmeraldSessionProvider(MemoryProvider):
             logger.error("aeon-emerald: %s not sent, captures wait in %s: %s", captured, spool_dir, error)
             return
         try:
-            waiting = drain(client, spool)
+            waiting = drain(client, spool, Ledger(self._home / "aeon-emerald" / "acknowledged-sessions"))
         finally:
             client.close()
         if captured and not waiting:
