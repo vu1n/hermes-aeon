@@ -113,39 +113,55 @@ def test_call_raises_with_tool_name_on_tool_error():
     transport, _ = mcp_server(missing)
     with pytest.raises(client.EmeraldError, match="fetch: .*NOT_FOUND") as raised:
         client.Emerald("http://aeon/mcp", "k", transport=transport).call("fetch", {"id": "x"})
-    assert raised.value.code == "NOT_FOUND" and not raised.value.transient
+    assert raised.value.code == "NOT_FOUND" and raised.value.detail == "no such claim"
 
 
 def _connect_error(request):
     raise httpx.ConnectError("unreachable", request=request)
 
 
-def _tool_failure(code):
+def _tool_failure(code, message="failed"):
     def reply(tool, args):
-        raise ToolFailure(code)
+        raise ToolFailure(code, message)
     return mcp_server(reply)[0]
 
 
-@pytest.mark.parametrize("transport, transient", [
-    (httpx.MockTransport(_connect_error), True),
-    (httpx.MockTransport(lambda r: httpx.Response(503, text="down")), True),
-    (httpx.MockTransport(lambda r: httpx.Response(429, text="slow down")), True),
-    (_tool_failure("UNAVAILABLE"), True),
-    (httpx.MockTransport(lambda r: httpx.Response(401, text="unauthorized")), False),
-    (_tool_failure("FORBIDDEN"), False),
-    (_tool_failure("INVALID_INPUT"), False),
-], ids=["unreachable", "503", "429", "UNAVAILABLE", "401", "FORBIDDEN", "INVALID_INPUT"])
-def test_errors_say_whether_a_retry_could_succeed(transport, transient):
+def _json_rpc_error(request):
+    return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.loads(request.content)["id"],
+                                     "error": {"code": -32603, "message": "internal"}})
+
+
+@pytest.mark.parametrize("transport, unreachable, input_refused", [
+    (httpx.MockTransport(_connect_error), True, False),
+    (_tool_failure("INVALID_INPUT"), False, True),
+    (httpx.MockTransport(lambda r: httpx.Response(401, text="unauthorized")), False, False),
+    (httpx.MockTransport(lambda r: httpx.Response(503, text="down")), False, False),
+    (httpx.MockTransport(lambda r: httpx.Response(200, text="<html>Access</html>")), False, False),
+    (httpx.MockTransport(_json_rpc_error), False, False),
+    (_tool_failure("UNAUTHENTICATED"), False, False),
+    (_tool_failure("FORBIDDEN"), False, False),
+    (_tool_failure("UNAVAILABLE"), False, False),
+], ids=["unreachable", "INVALID_INPUT", "401", "503", "html", "json-rpc", "UNAUTHENTICATED", "FORBIDDEN",
+        "UNAVAILABLE"])
+def test_errors_say_whether_emerald_answered_and_whether_it_refused_the_input(transport, unreachable, input_refused):
     with pytest.raises(client.EmeraldError) as raised:
         client.Emerald("http://aeon/mcp", "k", transport=transport).call("capture", {})
-    assert raised.value.transient is transient
+    assert (raised.value.unreachable, raised.value.input_refused) == (unreachable, input_refused)
 
 
-def test_capture_counts_a_conflict_as_already_stored():
+def test_capture_counts_a_reused_operation_id_as_already_stored():
     # Same operation id (same external id and content), different input: Emerald holds the content.
     arguments = client.capture_arguments(content="x", kind="text", external_id="x:1")
-    receipt = client.Emerald("http://aeon/mcp", "k", transport=_tool_failure("CONFLICT")).capture(arguments)
-    assert receipt["status"] == "duplicate"
+    conflict = _tool_failure("CONFLICT", "operation_id was already used with different input")
+    assert client.Emerald("http://aeon/mcp", "k", transport=conflict).capture(arguments)["status"] == "duplicate"
+
+
+def test_capture_does_not_count_a_deadlock_as_stored():
+    arguments = client.capture_arguments(content="x", kind="text", external_id="x:1")
+    deadlock = _tool_failure("CONFLICT", "deadlock detected")
+    with pytest.raises(client.EmeraldError, match="deadlock") as raised:
+        client.Emerald("http://aeon/mcp", "k", transport=deadlock).capture(arguments)
+    assert not raised.value.input_refused
 
 
 @pytest.mark.parametrize("status", ["stored", "duplicate"])
@@ -159,8 +175,9 @@ def test_capture_returns_the_receipt_when_emerald_has_the_episode(status):
 def test_capture_raises_when_emerald_rejects_the_episode():
     transport, _ = mcp_server(lambda tool, args: {"status": "rejected_sensitive", "reason": "sensitivity not opted in"})
     emerald = client.Emerald("http://aeon/mcp", "k", transport=transport)
-    with pytest.raises(client.EmeraldError, match="capture: rejected_sensitive: sensitivity not opted in"):
+    with pytest.raises(client.EmeraldError, match="capture: rejected_sensitive: sensitivity not opted in") as raised:
         emerald.capture(client.capture_arguments(content="x", kind="text", external_id="x:1"))
+    assert raised.value.input_refused
 
 
 def test_call_reads_plain_json_replies():
@@ -226,6 +243,12 @@ def captures_of(session_id, messages=MESSAGES, **kwargs):
 def test_transcript_keeps_only_what_the_user_and_hermes_said():
     assert session.transcript_turns(MESSAGES) == [
         "User: What did we decide about the VPS?", "Hermes: We moved Hermes to Emerald."]
+
+
+def test_transcripts_drop_nul_characters_postgresql_cannot_store():
+    pasted = [{"role": "user", "content": "binary\x00paste"},
+              {"role": "assistant", "content": [{"type": "text", "text": "seen\x00"}]}]
+    assert session.transcript_turns(pasted) == ["User: binarypaste", "Hermes: seen"]
 
 
 @pytest.mark.parametrize("summary", [
@@ -322,6 +345,36 @@ def test_an_outage_ends_the_drain_after_one_try(tmp_path):
         return _connect_error(request)
     assert session.drain(emerald_with(httpx.MockTransport(unreachable)), spool) == 3
     assert len(tries) == 1
+
+
+@pytest.mark.parametrize("failure", [
+    lambda request: httpx.Response(401, text="unauthorized"),  # a rotated key, or Emerald's key check failing
+    lambda request: _tool_failure("FORBIDDEN").handle_request(request),
+], ids=["401", "FORBIDDEN"])
+def test_an_endpoint_or_credential_failure_keeps_every_capture(tmp_path, failure):
+    spool = session.Spool(tmp_path / "spool")
+    spooled(spool, "s1", "s2", "s3")
+    tries = []
+
+    def failing(request):
+        tries.append(request)
+        return failure(request)
+    assert session.drain(emerald_with(httpx.MockTransport(failing)), spool) == 3
+    assert len(tries) == 3 and not (tmp_path / "spool" / "rejected").exists()
+
+
+def test_a_capture_emerald_keeps_failing_does_not_hold_back_the_rest(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    spooled(spool, "s1", "s2", "s3")
+
+    def capture(tool, args):
+        if args["thread_id"] == "s1":
+            raise ToolFailure("UNAVAILABLE", "invalid byte sequence")
+        return stored(tool, args)
+    transport, calls = mcp_server(capture)
+    assert session.drain(emerald_with(transport), spool) == 1
+    assert sorted(c[1]["thread_id"] for c in calls) == ["s1", "s2", "s3"]
+    assert [json.loads(p.read_text())["thread_id"] for p in spool.pending()] == ["s1"]
 
 
 def test_the_spool_drains_oldest_first(tmp_path):

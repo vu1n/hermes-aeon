@@ -23,13 +23,19 @@ SOURCE_KINDS = frozenset({"text", "transcript", "repository", "document", "tool"
 class EmeraldError(RuntimeError):
     """A failed Emerald call, with the tool name and the server's code or HTTP status in the message.
 
-    ``transient`` marks failures worth retrying later: Emerald unreachable or timing out, HTTP 429 or
-    5xx, or the tool's UNAVAILABLE. ``code`` is the tool's error code (e.g. ``CONFLICT``), if any."""
+    ``unreachable``: no reply at all (connection failed or timed out), so the next call would fail the
+    same way. ``input_refused``: Emerald refused this request's input itself (INVALID_INPUT, or a capture
+    rejected for its sensitivity), so resending it cannot succeed. Neither: the endpoint, the credentials
+    or Emerald failed (any other HTTP status, UNAUTHENTICATED, FORBIDDEN, UNAVAILABLE...), which says
+    nothing about this input. ``code`` and ``detail`` are the tool's error code and message, if any."""
 
-    def __init__(self, message: str, *, transient: bool = False, code: Optional[str] = None) -> None:
+    def __init__(self, message: str, *, unreachable: bool = False, input_refused: bool = False,
+                 code: Optional[str] = None, detail: Optional[str] = None) -> None:
         super().__init__(message)
-        self.transient = transient
+        self.unreachable = unreachable
+        self.input_refused = input_refused
         self.code = code
+        self.detail = detail
 
 
 class SettingMissing(RuntimeError):
@@ -96,10 +102,9 @@ class Emerald:
         try:
             response = self._http.post(self._url, json=request)
         except httpx.HTTPError as error:
-            raise EmeraldError(f"{tool}: {type(error).__name__}: {error} ({self._url})", transient=True) from error
+            raise EmeraldError(f"{tool}: {type(error).__name__}: {error} ({self._url})", unreachable=True) from error
         if response.status_code != 200:
-            raise EmeraldError(f"{tool}: HTTP {response.status_code}: {response.text[:300]}",
-                               transient=response.status_code == 429 or response.status_code >= 500)
+            raise EmeraldError(f"{tool}: HTTP {response.status_code}: {response.text[:300]}")
         try:
             body = _response_message(response, request["id"])
         except ValueError as error:
@@ -112,7 +117,8 @@ class Emerald:
         if result.get("isError"):
             detail = structured or [part.get("text") for part in result.get("content") or []]
             code = structured.get("code") if isinstance(structured, dict) else None
-            raise EmeraldError(f"{tool}: {detail}", transient=code == "UNAVAILABLE", code=code)
+            message = structured.get("message") if isinstance(structured, dict) else None
+            raise EmeraldError(f"{tool}: {detail}", input_refused=code == "INVALID_INPUT", code=code, detail=message)
         if not isinstance(structured, dict):
             raise EmeraldError(f"{tool}: result has no structuredContent: {json.dumps(result)[:300]}")
         return structured
@@ -125,13 +131,15 @@ class Emerald:
         try:
             receipt = self.call("capture", arguments)
         except EmeraldError as error:
-            if error.code != "CONFLICT":
-                raise
-            # The operation id covers the external id and the content, so a conflict means Emerald already
-            # holds this content, sent earlier with other metadata (such as an earlier occurred_at).
-            return {"status": "duplicate", "reason": str(error)}
+            # The operation id covers the external id and the content, so a reused id with other input
+            # means Emerald already holds this content, sent earlier with other metadata (such as an
+            # earlier occurred_at). Emerald's other CONFLICT (a database deadlock) is not that.
+            if error.code == "CONFLICT" and "operation_id" in (error.detail or ""):
+                return {"status": "duplicate", "reason": str(error)}
+            raise
         if receipt.get("status") not in ("stored", "duplicate"):
-            raise EmeraldError(f"capture: {receipt.get('status')}: {receipt.get('reason')}")
+            raise EmeraldError(f"capture: {receipt.get('status')}: {receipt.get('reason')}",
+                               input_refused=receipt.get("status") == "rejected_sensitive")
         return receipt
 
 

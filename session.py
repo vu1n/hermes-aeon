@@ -25,12 +25,11 @@ COMPACTION_PREFIXES = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:")
 
 
 def _text(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
     if isinstance(content, list):  # OpenAI-style content parts; images and other parts are dropped
-        return "\n".join(p.get("text", "").strip() for p in content
-                         if isinstance(p, dict) and p.get("type") == "text" and p.get("text")).strip()
-    return ""
+        content = "\n".join(p.get("text", "") for p in content
+                            if isinstance(p, dict) and p.get("type") == "text" and p.get("text"))
+    # PostgreSQL text cannot hold NUL (pasted binary or terminal output); Emerald would fail the capture.
+    return content.replace("\x00", "").strip() if isinstance(content, str) else ""
 
 
 def _compaction_summary(message: dict[str, Any]) -> Optional[str]:
@@ -145,9 +144,11 @@ class Spool:
 def drain(client: Emerald, spool: Spool) -> int:
     """Send spooled captures, oldest first, and return how many are still waiting.
 
-    A transient failure ends the drain: the rest would fail the same way, each try costing a timeout,
-    so they wait for the next session end. A capture Emerald rejects for good, or a file that cannot be
-    read, moves to ``rejected/`` and is logged, rather than being retried at every session end."""
+    Only a refusal of the capture's own content (or a file that cannot be read) moves it to ``rejected/``.
+    Any other failure leaves it to be resent at a later session end: a 401 after a key rotation, or an
+    Emerald database blip, must not sweep the backlog aside. No reply at all ends the drain, since the
+    rest would each wait out the same timeout; any other failure moves on to the next capture, so one
+    capture Emerald keeps failing does not hold back the rest."""
     for path in spool.pending():
         try:
             arguments = json.loads(path.read_text(encoding="utf-8"))
@@ -161,11 +162,14 @@ def drain(client: Emerald, spool: Spool) -> int:
         try:
             client.capture(arguments)
         except EmeraldError as error:
-            if error.transient:
-                logger.error("aeon-emerald: Emerald unavailable, captures wait in the spool: %s", error)
+            if error.unreachable:
+                logger.error("aeon-emerald: Emerald unreachable, captures wait in the spool: %s", error)
                 break
-            logger.error("aeon-emerald: capture of %s rejected, moved to %s: %s",
-                         external_id, spool.reject(path), error)
+            if error.input_refused:
+                logger.error("aeon-emerald: capture of %s refused, moved to %s: %s",
+                             external_id, spool.reject(path), error)
+            else:
+                logger.error("aeon-emerald: capture of %s failed, left in the spool: %s", external_id, error)
             continue
         path.unlink(missing_ok=True)
     return len(spool.pending())
