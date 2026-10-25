@@ -126,6 +126,15 @@ def test_call_reads_plain_json_replies():
     assert emerald.call("timeline", {}) == {"items": []}
 
 
+def test_call_reads_crlf_event_streams_with_several_events():
+    def reply(request):
+        note = {"jsonrpc": "2.0", "method": "notifications/message", "params": {}}
+        answer = {"jsonrpc": "2.0", "id": json.loads(request.content)["id"], "result": {"structuredContent": {"ok": 1}}}
+        text = "".join(f"event: message\r\ndata: {json.dumps(m)}\r\n\r\n" for m in (note, answer))
+        return httpx.Response(200, text=text, headers={"content-type": "text/event-stream"})
+    assert client.Emerald("http://aeon/mcp", "k", transport=httpx.MockTransport(reply)).call("whoami", {}) == {"ok": 1}
+
+
 @pytest.mark.parametrize("response, pattern", [
     (httpx.Response(401, text="unauthorized"), "HTTP 401"),
     (httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "bad"}}),
@@ -178,6 +187,12 @@ def test_long_transcripts_split_at_turn_boundaries_and_oversized_turns_are_cut()
     assert "".join(parts[1:]) == f"User: {'c' * 130}"
 
 
+def test_turns_that_exactly_fill_a_part_stay_in_one_part():
+    messages = [{"role": "user", "content": "a" * 10}, {"role": "assistant", "content": "b" * 10}]
+    whole = f"User: {'a' * 10}\n\nHermes: {'b' * 10}"
+    assert session.transcript_parts(messages, limit=len(whole)) == [whole]
+
+
 def test_session_captures_name_parts_and_thread_by_session():
     one = session.session_captures("s1", MESSAGES, platform="telegram")
     assert len(one) == 1
@@ -203,6 +218,13 @@ def test_failed_captures_are_spooled_and_sent_on_a_later_session_end(tmp_path):
     assert session.send(client.Emerald("http://aeon/mcp", "k", transport=transport), spool, []) == 0
     assert spool.pending() == []
     assert calls[0][1] == captures[0]
+
+
+def test_spooled_transcripts_are_readable_only_by_their_owner(tmp_path):
+    spool = session.Spool(tmp_path / "spool")
+    path = spool.put(session.session_captures("s1", MESSAGES)[0])
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "spool").stat().st_mode & 0o777 == 0o700
 
 
 # -- provider ---------------------------------------------------------------------------------------------
@@ -231,6 +253,28 @@ def test_provider_spools_when_settings_are_missing(provider, tmp_path):
     chat.initialize("s1", hermes_home=str(tmp_path), platform="telegram")
     chat.on_session_end(MESSAGES)
     assert len(session.Spool(tmp_path / "aeon-emerald" / "spool").pending()) == 1
+
+
+def test_provider_is_available_only_with_url_and_key(provider, tmp_path, monkeypatch):
+    monkeypatch.setattr(provider, "get_hermes_home", lambda: tmp_path)
+    for name in ("AEON_EMERALD_URL", "AEON_EMERALD_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text("AEON_EMERALD_URL=http://aeon/mcp\n")
+    assert not provider.EmeraldSessionProvider().is_available()
+    (tmp_path / ".env").write_text("AEON_EMERALD_URL=http://aeon/mcp\nAEON_EMERALD_KEY=k\n")
+    assert provider.EmeraldSessionProvider().is_available()
+
+
+def test_provider_resends_the_spool_at_a_session_end_with_nothing_new(provider, tmp_path, monkeypatch):
+    session.Spool(tmp_path / "aeon-emerald" / "spool").put(session.session_captures("old", MESSAGES)[0])
+    sent = []
+    monkeypatch.setattr(provider.Emerald, "from_settings", classmethod(lambda cls, home, key: object.__new__(cls)))
+    monkeypatch.setattr(provider.Emerald, "close", lambda self: None)
+    monkeypatch.setattr(provider, "send", lambda c, spool, captures: sent.append(captures) or 0)
+    chat = provider.EmeraldSessionProvider()
+    chat.initialize("s1", hermes_home=str(tmp_path), platform="telegram")
+    chat.on_session_end([{"role": "assistant", "content": "Good morning"}])
+    assert sent == [[]]
 
 
 def test_a_rejected_spooled_capture_stays_in_the_spool(tmp_path):
@@ -283,6 +327,16 @@ def test_oura_run_reports_fetch_and_capture_failures():
     assert [c[1]["source"]["external_id"] for c in calls] == ["oura:sleep:2026-10-23", "oura:sleep:2026-10-24"]
 
 
+def test_oura_main_exits_1_when_anything_failed(tmp_path, monkeypatch, capsys):
+    oura = load_job("oura_pull")
+    (tmp_path / ".env").write_text("AEON_EMERALD_URL=http://aeon/mcp\nAEON_EMERALD_OURA_KEY=k\nOURA_PAT=t\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for errors, status in (([], 0), (["fetch daily_sleep: boom"], 1)):
+        monkeypatch.setattr(oura, "run", lambda emerald, http, days, errors=errors: {"errors": errors})
+        assert oura.main([]) == status
+    assert '"errors": ["fetch daily_sleep: boom"]' in capsys.readouterr().out
+
+
 # -- digest inputs ----------------------------------------------------------------------------------------
 
 def freshrss(pages, seen=None):
@@ -320,6 +374,13 @@ def test_freshrss_login_failure_is_an_error():
         digest.freshrss_items(freshrss({}), "https://rss", "admin", "wrong", 1792800000)
 
 
+def test_freshrss_login_without_an_auth_token_is_an_error():
+    digest = load_job("digest_inputs")
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, text="Error=BadAuthentication\n")))
+    with pytest.raises(digest.SourceError, match="HTTP 200, no Auth token"):
+        digest.freshrss_items(http, "https://rss", "admin", "pw", 1792800000)
+
+
 def test_watermark_starts_a_window_back_then_follows_the_newest_crawl(tmp_path):
     digest = load_job("digest_inputs")
     now = digest.datetime(2026, 10, 25, 8, tzinfo=digest.timezone.utc)
@@ -354,6 +415,7 @@ def test_missing_password_source_is_reported(tmp_path, monkeypatch, capsys, fres
                                    f"FRESHRSS_PASSWORD_FILE={tmp_path / 'freshrss.env'}\n"
                                    "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("FRESHRSS_API_PASSWORD", "from-env")  # not a fallback
     assert digest.main([]) == 1
     assert error in capsys.readouterr().err
 
@@ -387,6 +449,28 @@ def test_digest_reads_both_sources_and_advances_the_watermark(tmp_path, monkeypa
     assert (tmp_path / "aeon-emerald" / "freshrss-watermark").read_text() == "1792900001\n"
 
 
+def test_watermark_stays_put_when_emerald_cannot_be_read(tmp_path, monkeypatch, capsys):
+    digest = load_job("digest_inputs")
+    (tmp_path / "freshrss.env").write_text("ADMIN_API_PASSWORD=pw\n")
+    (tmp_path / ".env").write_text("FRESHRSS_URL=https://rss/\nFRESHRSS_USER=admin\n"
+                                   f"FRESHRSS_PASSWORD_FILE={tmp_path / 'freshrss.env'}\n"
+                                   "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    pages = {"": {"items": [{"title": "A", "crawlTimeMsec": "1792900000999", "origin": {"title": "F"}}]}}
+    rss, real_client = freshrss(pages), httpx.Client
+    monkeypatch.setattr(digest.httpx, "Client", lambda **kw: real_client(**kw) if "transport" in kw else rss)
+
+    def down(tool, args):
+        raise LookupError("unavailable")
+    transport, _ = mcp_server(down)
+    real_emerald = digest.Emerald
+    monkeypatch.setattr(digest.Emerald, "from_settings",
+                        classmethod(lambda cls, home, key: real_emerald("http://aeon/mcp", "k", transport=transport)))
+    assert digest.main([]) == 1
+    assert "timeline" in capsys.readouterr().err
+    assert not (tmp_path / "aeon-emerald" / "freshrss-watermark").exists()
+
+
 def test_timeline_pages_past_the_limit_without_duplicates(monkeypatch):
     digest = load_job("digest_inputs")
     monkeypatch.setattr(digest, "TIMELINE_PAGE", 2)
@@ -401,6 +485,17 @@ def test_timeline_pages_past_the_limit_without_duplicates(monkeypatch):
     items = digest.timeline_items(digest.Emerald("http://aeon/mcp", "k", transport=transport),
                                   since, since + digest.timedelta(days=2))
     assert [i["id"] for i in items] == ["e0", "e1", "e2"]
+
+
+def test_timeline_stops_when_a_page_brings_nothing_new(monkeypatch):
+    digest = load_job("digest_inputs")
+    monkeypatch.setattr(digest, "TIMELINE_PAGE", 2)
+    same_time = [{"kind": "episode", "id": f"e{i}", "text": "t", "at": "2026-10-24T00:00:00Z"} for i in range(2)]
+    transport, calls = mcp_server(lambda tool, args: {"items": same_time, "from": args["from"], "to": args["to"]})
+    since = digest.datetime(2026, 10, 23, tzinfo=digest.timezone.utc)
+    items = digest.timeline_items(digest.Emerald("http://aeon/mcp", "k", transport=transport),
+                                  since, since + digest.timedelta(days=2))
+    assert [i["id"] for i in items] == ["e0", "e1"] and len(calls) == 2
 
 
 def test_render_groups_feeds_and_separates_saved_items_from_facts():
