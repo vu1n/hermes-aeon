@@ -23,8 +23,14 @@ libSQL brain below is a read-only archive. `aeon_emerald/` holds what Hermes nee
   environments, so they read `$HERMES_HOME/.env` themselves.
 
 Settings in `$HERMES_HOME/.env`: `AEON_EMERALD_URL`, `AEON_EMERALD_KEY` (Hermes's principal),
-`AEON_EMERALD_OURA_KEY` (a capture-only principal with the `health` sensitivity), `OURA_PAT`,
-`FRESHRSS_URL`, `FRESHRSS_USER`, `FRESHRSS_API_PASSWORD`.
+`AEON_EMERALD_OURA_KEY` (read+capture limited to project `health`, source `text`, sensitivity
+`health`: Emerald requires read on whatever a principal writes), `OURA_PAT`, `FRESHRSS_URL`,
+`FRESHRSS_USER`, and for tumbler `TUMBLER_NODE`, `TUMBLER_CLI`, `TUMBLER_TOKEN_FILE`.
+
+`FRESHRSS_API_PASSWORD` is never written to a file: the digest script re-runs itself under
+`tumbler run -k FRESHRSS_API_PASSWORD`, with a tumbler token pinned to that key's scope. It reads
+FreshRSS only (the account is the owner's own) and keeps the newest crawl time it digested in
+`$HERMES_HOME/aeon-emerald/freshrss-watermark`, passed back as `ot`.
 
 ## Install
 

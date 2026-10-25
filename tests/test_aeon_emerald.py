@@ -262,36 +262,110 @@ def test_oura_run_reports_fetch_and_capture_failures():
 
 # -- digest inputs ----------------------------------------------------------------------------------------
 
-def freshrss(pages):
+def freshrss(pages, seen=None):
     def api(request):
         if request.url.path.endswith("/accounts/ClientLogin"):
             body = dict(httpx.QueryParams(request.content.decode()))
             if body != {"Email": "admin", "Passwd": "pw"}:
                 return httpx.Response(401, text="Unauthorized!")
             return httpx.Response(200, text="SID=x\nLSID=null\nAuth=admin/tok\n")
+        assert request.url.path == "/api/greader.php/reader/api/0/stream/contents/user/-/state/com.google/reading-list"
         assert request.headers["authorization"] == "GoogleLogin auth=admin/tok"
+        if seen is not None:
+            seen.append(dict(request.url.params))
         return httpx.Response(200, json=pages[request.url.params.get("c", "")])
     return httpx.Client(transport=httpx.MockTransport(api))
 
 
 def test_freshrss_items_follow_continuations_and_flatten_fields():
     digest = load_job("digest_inputs")
-    item = {"title": "Big &amp; new", "origin": {"title": "Simon Willison"},
+    item = {"title": "Big &amp; new", "origin": {"title": "Simon Willison"}, "crawlTimeMsec": "1792900000123",
             "categories": ["user/-/state/com.google/reading-list", "user/-/label/Tech"],
             "canonical": [{"href": "https://example.com/a"}], "summary": {"content": "<p>Some <b>text</b></p>"}}
     pages = {"": {"items": [item], "continuation": "next"}, "next": {"items": [{"title": "Second"}]}}
-    items = digest.freshrss_items(freshrss(pages), "https://rss", "admin", "pw",
-                                  digest.datetime(2026, 10, 24, tzinfo=digest.timezone.utc))
+    seen = []
+    items = digest.freshrss_items(freshrss(pages, seen), "https://rss", "admin", "pw", 1792800000)
     assert items[0] == {"title": "Big & new", "feed": "Simon Willison", "category": "Tech",
-                        "url": "https://example.com/a", "published": None, "snippet": "Some text"}
-    assert items[1]["category"] == "Uncategorized" and items[1]["url"] is None
+                        "url": "https://example.com/a", "crawled": 1792900000, "snippet": "Some text"}
+    assert items[1]["category"] == "Uncategorized" and items[1]["url"] is None and items[1]["crawled"] == 0
+    assert [s.get("ot") for s in seen] == ["1792800000", "1792800000"] and seen[1]["c"] == "next"
 
 
 def test_freshrss_login_failure_is_an_error():
     digest = load_job("digest_inputs")
-    with pytest.raises(digest.SourceError, match="login: HTTP 401"):
-        digest.freshrss_items(freshrss({}), "https://rss", "admin", "wrong",
-                              digest.datetime(2026, 10, 24, tzinfo=digest.timezone.utc))
+    with pytest.raises(digest.SourceError, match="login: HTTP 401, no Auth token"):
+        digest.freshrss_items(freshrss({}), "https://rss", "admin", "wrong", 1792800000)
+
+
+def test_watermark_starts_a_window_back_then_follows_the_newest_crawl(tmp_path):
+    digest = load_job("digest_inputs")
+    now = digest.datetime(2026, 10, 25, 8, tzinfo=digest.timezone.utc)
+    mark = digest.Watermark(tmp_path / "state" / "freshrss-watermark")
+    assert mark.since(now, 24) == int((now - digest.timedelta(hours=24)).timestamp())
+    mark.advance([{"crawled": 1792900000}, {"crawled": 0}, {"crawled": 1792900500}])
+    assert mark.since(now, 24) == 1792900501
+    mark.advance([])  # nothing new keeps the mark
+    assert mark.since(now, 24) == 1792900501
+    later = now + digest.timedelta(days=30)  # after a long pause, at most MAX_FEED_LOOKBACK
+    assert mark.since(later, 24) == int((later - digest.MAX_FEED_LOOKBACK).timestamp())
+
+
+def test_without_the_password_the_script_reruns_itself_under_tumbler(tmp_path, monkeypatch):
+    digest = load_job("digest_inputs")
+    (tmp_path / "token").write_text("tok-123\n")
+    (tmp_path / ".env").write_text(f"TUMBLER_TOKEN_FILE={tmp_path / 'token'}\nTUMBLER_NODE=/n/node\n"
+                                   "TUMBLER_CLI=/t/tumbler\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
+    monkeypatch.delenv(digest.UNDER_TUMBLER, raising=False)
+    runs = []
+    monkeypatch.setattr(digest.subprocess, "run",
+                        lambda command, env, cwd: runs.append((command, env, cwd)) or types.SimpleNamespace(returncode=3))
+    assert digest.main(["--hours", "12"]) == 3
+    command, env, cwd = runs[0]
+    assert command[:6] == ["/n/node", "/t/tumbler", "run", "-k", "FRESHRSS_API_PASSWORD", "--"]
+    assert command[-3:] == [str(PACKAGE / "jobs" / "digest_inputs.py"), "--hours", "12"]
+    assert env["TUMBLER_TOKEN"] == "tok-123" and env[digest.UNDER_TUMBLER] == "1"
+    assert cwd == tmp_path
+
+
+def test_tumbler_without_the_password_is_reported_not_rerun(tmp_path, monkeypatch, capsys):
+    digest = load_job("digest_inputs")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
+    monkeypatch.setenv(digest.UNDER_TUMBLER, "1")
+    monkeypatch.setattr(digest.subprocess, "run", lambda *a, **k: pytest.fail("reran under tumbler again"))
+    assert digest.main([]) == 1
+    assert "without FRESHRSS_API_PASSWORD" in capsys.readouterr().err
+
+
+def test_missing_tumbler_token_is_reported(tmp_path, monkeypatch, capsys):
+    digest = load_job("digest_inputs")
+    (tmp_path / ".env").write_text(f"TUMBLER_TOKEN_FILE={tmp_path / 'absent'}\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
+    monkeypatch.delenv(digest.UNDER_TUMBLER, raising=False)
+    assert digest.main([]) == 1
+    assert f"no tumbler token at {tmp_path / 'absent'}" in capsys.readouterr().err
+
+
+def test_digest_reads_both_sources_and_advances_the_watermark(tmp_path, monkeypatch, capsys):
+    digest = load_job("digest_inputs")
+    (tmp_path / ".env").write_text("FRESHRSS_URL=https://rss/\nFRESHRSS_USER=admin\n"
+                                   "AEON_EMERALD_URL=http://aeon/mcp\nAEON_EMERALD_KEY=k\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("FRESHRSS_API_PASSWORD", "pw")
+    pages = {"": {"items": [{"title": "A", "crawlTimeMsec": "1792900000999", "origin": {"title": "F"}}]}}
+    rss, real_client = freshrss(pages), httpx.Client
+    # Only the FreshRSS client is built without a transport; Emerald's below gets the fake MCP one.
+    monkeypatch.setattr(digest.httpx, "Client", lambda **kw: real_client(**kw) if "transport" in kw else rss)
+    transport, _ = mcp_server(lambda tool, args: {"items": [], "from": args["from"], "to": args["to"]})
+    real_emerald = digest.Emerald
+    monkeypatch.setattr(digest.Emerald, "from_settings",
+                        classmethod(lambda cls, home, key: real_emerald("http://aeon/mcp", "k", transport=transport)))
+    assert digest.main([]) == 0
+    assert "## Feeds (FreshRSS, 1 new items)" in capsys.readouterr().out
+    assert (tmp_path / "aeon-emerald" / "freshrss-watermark").read_text() == "1792900001\n"
 
 
 def test_timeline_pages_past_the_limit_without_duplicates(monkeypatch):
@@ -313,18 +387,9 @@ def test_timeline_pages_past_the_limit_without_duplicates(monkeypatch):
 def test_render_groups_feeds_and_separates_saved_items_from_facts():
     digest = load_job("digest_inputs")
     text = digest.render(
-        [{"title": "A", "feed": "F", "category": "Tech", "url": "https://a", "published": 1, "snippet": "s"}],
+        [{"title": "A", "feed": "F", "category": "Tech", "url": "https://a", "crawled": 1, "snippet": "s"}],
         [{"kind": "episode", "id": "e", "text": "Saved note", "at": "2026-10-24T01:00:00Z"},
          {"kind": "claim", "id": "c", "text": "Vu prefers X", "at": "2026-10-24T01:00:00Z"}], 24)
-    assert "## Feeds (FreshRSS, 1 items)\n\n### Tech\n- A (F) <https://a>\n  s" in text
-    assert "## Memory (Aeon: 1 saved items, 1 new facts)" in text
+    assert "## Feeds (FreshRSS, 1 new items)\n\n### Tech\n- A (F) <https://a>\n  s" in text
+    assert "## Memory (Aeon, last 24 hours: 1 saved items, 1 new facts)" in text
     assert text.endswith("### New facts\n- Vu prefers X")
-
-
-def test_digest_fails_loudly_when_a_source_is_not_configured(tmp_path, monkeypatch, capsys):
-    digest = load_job("digest_inputs")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    for name in ("FRESHRSS_URL", "FRESHRSS_USER", "FRESHRSS_API_PASSWORD", "AEON_EMERALD_URL", "AEON_EMERALD_KEY"):
-        monkeypatch.delenv(name, raising=False)
-    assert digest.main([]) == 1
-    assert "FRESHRSS_URL is not set" in capsys.readouterr().err
