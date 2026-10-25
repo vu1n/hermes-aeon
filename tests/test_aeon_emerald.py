@@ -418,6 +418,36 @@ def test_provider_resends_the_spool_at_a_session_end_with_nothing_new(provider, 
     assert drained == [["hermes-session:old:0:1"]]
 
 
+def started(provider, tmp_path, **kwargs):
+    chat = provider.EmeraldSessionProvider()
+    chat.initialize("s1", hermes_home=str(tmp_path), platform="cli", **kwargs)
+    chat.sync_turn("What did we decide?", "Emerald.", session_id="s1", messages=MESSAGES)
+    return chat
+
+
+@pytest.mark.parametrize("reason", ["resumed_other", "branched"])
+def test_a_session_left_by_resume_or_branch_is_saved_on_the_switch(provider, drained, tmp_path, reason):
+    started(provider, tmp_path).on_session_switch("s2", parent_session_id="s1", reset=False, reason=reason)
+    assert drained == [["hermes-session:s1:0:1"]]
+
+
+def test_a_session_that_ended_is_not_saved_again_on_the_switch(provider, drained, tmp_path):
+    chat = started(provider, tmp_path)
+    chat.on_session_end(MESSAGES)
+    chat.on_session_switch("s2", reset=True)
+    assert drained == [["hermes-session:s1:0:1"]]
+
+
+def test_a_rewind_is_not_a_departure(provider, drained, tmp_path):
+    started(provider, tmp_path).on_session_switch("s1", rewound=True)
+    assert drained == []
+
+
+def test_a_cron_session_is_not_saved_on_the_switch(provider, drained, tmp_path):
+    started(provider, tmp_path, agent_context="cron").on_session_switch("s2", reset=False)
+    assert drained == []
+
+
 # -- oura job ---------------------------------------------------------------------------------------------
 
 def test_oura_rows_become_health_episodes_keyed_by_category_and_day():

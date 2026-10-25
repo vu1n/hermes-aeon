@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
@@ -35,6 +35,8 @@ class EmeraldSessionProvider(MemoryProvider):
         self._session_id = ""
         self._platform = ""
         self._writes = False
+        # The transcript as of the last turn, until the session is saved.
+        self._latest: Optional[List[Dict[str, Any]]] = None
 
     @property
     def name(self) -> str:
@@ -64,10 +66,25 @@ class EmeraldSessionProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
 
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  messages: Optional[List[Dict[str, Any]]] = None, **kwargs: Any) -> None:
+        # Hermes passes the redacted transcript after each turn (off the main thread; this only keeps it).
+        if messages is not None:
+            self._latest = list(messages)
+
     def on_session_switch(self, new_session_id: str, **kwargs: Any) -> None:
+        # /resume and /branch leave a session without on_session_end; /new and compaction end it first,
+        # which clears the snapshot. A rewind keeps the id and is not a departure.
+        if new_session_id != self._session_id and self._latest:
+            self._save(self._latest)
         self._session_id = new_session_id
+        self._latest = None
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        self._save(messages)
+        self._latest = None
+
+    def _save(self, messages: List[Dict[str, Any]]) -> None:
         if not self._writes:
             return
         ended_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
