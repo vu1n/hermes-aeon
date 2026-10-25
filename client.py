@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping, Optional
 import httpx
 
 # Fixed so operation ids, and with them Emerald's per-(principal, operation_id) replay, survive restarts.
+# The string is an identifier, not a path: changing it would re-store everything already captured.
 _OPERATION_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/vu1n/hermes-aeon/aeon_emerald")
 SOURCE_KINDS = frozenset({"text", "transcript", "repository", "document", "tool"})
 
