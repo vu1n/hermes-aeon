@@ -464,6 +464,14 @@ def test_oura_rows_become_health_episodes_keyed_by_category_and_day():
     assert oura.episode("sleep", {"score": 1}, oura.render_sleep) is None
 
 
+def test_sleep_renders_what_a_daily_sleep_row_has():
+    oura = load_job("oura_pull")
+    row = {"id": "x", "day": "2026-10-24", "score": 81, "timestamp": "2026-10-24T00:00:00.000+00:00",
+           "contributors": {"deep_sleep": 70, "rem_sleep": 90}}  # the fields /daily_sleep returns
+    assert oura.render_sleep(row) == ("Sleep 2026-10-24: score 81\n\ndate: 2026-10-24\nscore: 81\n"
+                                      "contributors: {'deep_sleep': 70, 'rem_sleep': 90}")
+
+
 def test_oura_run_reports_fetch_and_capture_failures():
     oura = load_job("oura_pull")
 

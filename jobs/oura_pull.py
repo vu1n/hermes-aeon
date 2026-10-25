@@ -33,13 +33,9 @@ def _minutes(seconds: Optional[int]) -> str:
 
 
 def render_sleep(d: dict) -> str:
-    title = f"Sleep {d.get('day')}: score {d.get('score')}"
-    if d.get("total_sleep_duration"):
-        title += f" · total {_minutes(d['total_sleep_duration'])}"
-    return "\n".join([title, "", f"date: {d.get('day')}", f"score: {d.get('score')}",
-                      f"total_sleep: {_minutes(d.get('total_sleep_duration'))}",
-                      f"deep: {_minutes(d.get('deep_sleep_duration'))}",
-                      f"rem: {_minutes(d.get('rem_sleep_duration'))}",
+    # daily_sleep carries the score and its contributors; durations are only on the /sleep periods.
+    return "\n".join([f"Sleep {d.get('day')}: score {d.get('score')}", "",
+                      f"date: {d.get('day')}", f"score: {d.get('score')}",
                       f"contributors: {d.get('contributors') or {}}"])
 
 
