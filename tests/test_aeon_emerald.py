@@ -522,12 +522,15 @@ def test_freshrss_items_follow_continuations_and_flatten_fields():
     item = {"title": "Big &amp; new", "origin": {"title": "Simon Willison"}, "crawlTimeMsec": "1792900000123",
             "categories": ["user/-/state/com.google/reading-list", "user/-/label/Tech"],
             "canonical": [{"href": "https://example.com/a"}], "summary": {"content": "<p>Some <b>text</b></p>"}}
-    pages = {"": {"items": [item], "continuation": "next"}, "next": {"items": [{"title": "Second"}]}}
+    modified_old_item = {"title": "Edited last week", "crawlTimeMsec": "1792200000000"}  # FreshRSS 1.29+ ot
+    pages = {"": {"items": [item, modified_old_item], "continuation": "next"},
+             "next": {"items": [{"title": "Second", "crawlTimeMsec": "1792800000000"}]}}
     seen = []
     items = digest.freshrss_items(freshrss(pages, seen), "https://rss", "admin", "pw", 1792800000)
     assert items[0] == {"title": "Big & new", "feed": "Simon Willison", "category": "Tech",
                         "url": "https://example.com/a", "crawled": 1792900000, "snippet": "Some text"}
-    assert items[1]["category"] == "Uncategorized" and items[1]["url"] is None and items[1]["crawled"] == 0
+    assert [i["title"] for i in items] == ["Big & new", "Second"]
+    assert items[1]["category"] == "Uncategorized" and items[1]["url"] is None
     assert [s.get("ot") for s in seen] == ["1792800000", "1792800000"] and seen[1]["c"] == "next"
 
 
@@ -544,17 +547,30 @@ def test_freshrss_login_without_an_auth_token_is_an_error():
         digest.freshrss_items(http, "https://rss", "admin", "pw", 1792800000)
 
 
-def test_watermark_starts_a_window_back_then_follows_the_newest_crawl(tmp_path):
+def test_watermark_repeats_the_day_moves_on_the_next_and_never_back(tmp_path):
     digest = load_job("digest_inputs")
-    now = digest.datetime(2026, 10, 25, 8, tzinfo=digest.timezone.utc)
+    hours = digest.timedelta(hours=1)
     mark = digest.Watermark(tmp_path / "state" / "freshrss-watermark")
-    assert mark.since(now, 24) == int((now - digest.timedelta(hours=24)).timestamp())
-    mark.advance([{"crawled": 1792900000}, {"crawled": 0}, {"crawled": 1792900500}])
-    assert mark.since(now, 24) == 1792900501
-    mark.advance([])  # nothing new keeps the mark
-    assert mark.since(now, 24) == 1792900501
-    later = now + digest.timedelta(days=30)  # after a long pause, at most MAX_FEED_LOOKBACK
+    morning = digest.datetime(2026, 10, 25, 8, tzinfo=digest.timezone.utc)
+    first = mark.since(morning, 24)
+    assert first == int((morning - 24 * hours).timestamp())
+    mark.advance(morning, first, [{"crawled": 1792900000}, {"crawled": 1792900500}])
+    retry = morning + hours / 2  # Hermes re-runs a digest whose model call failed
+    assert mark.since(retry, 24) == first
+    mark.advance(retry, first, [{"crawled": 1792900100}])
+    tomorrow = morning + 24 * hours
+    assert mark.since(tomorrow, 24) == 1792900501  # just after the newest item any run saw
+    mark.advance(tomorrow, 1792900501, [])
+    assert mark.since(tomorrow + 24 * hours, 24) == 1792900501  # an empty day keeps the mark
+    later = morning + 30 * 24 * hours  # after a long pause, at most MAX_FEED_LOOKBACK
     assert mark.since(later, 24) == int((later - digest.MAX_FEED_LOOKBACK).timestamp())
+
+
+def test_an_unreadable_watermark_is_an_error(tmp_path):
+    digest = load_job("digest_inputs")
+    (tmp_path / "freshrss-watermark").write_text("1792900001\n")
+    with pytest.raises(digest.SourceError, match="unreadable watermark"):
+        digest.Watermark(tmp_path / "freshrss-watermark").since(digest.datetime.now(digest.timezone.utc), 24)
 
 
 def test_password_comes_only_from_the_freshrss_env_file(tmp_path, monkeypatch):
@@ -609,7 +625,7 @@ def test_digest_reads_both_sources_and_advances_the_watermark(tmp_path, monkeypa
                         classmethod(lambda cls, home, key: real_emerald("http://aeon/mcp", "k", transport=transport)))
     assert digest.main([]) == 0
     assert "## Feeds (FreshRSS, 1 new items)" in capsys.readouterr().out
-    assert (tmp_path / "aeon-emerald" / "freshrss-watermark").read_text() == "1792900001\n"
+    assert json.loads((tmp_path / "aeon-emerald" / "freshrss-watermark").read_text())["next"] == 1792900001
 
 
 def test_watermark_stays_put_when_emerald_cannot_be_read(tmp_path, monkeypatch, capsys):
@@ -645,9 +661,9 @@ def test_timeline_pages_past_the_limit_without_duplicates(monkeypatch):
         return {"items": later[:args["limit"]], "from": args["from"], "to": args["to"]}
     transport, _ = mcp_server(timeline)
     since = digest.datetime(2026, 10, 23, tzinfo=digest.timezone.utc)
-    items = digest.timeline_items(digest.Emerald("http://aeon/mcp", "k", transport=transport),
-                                  since, since + digest.timedelta(days=2))
-    assert [i["id"] for i in items] == ["e0", "e1", "e2"]
+    items, complete = digest.timeline_items(digest.Emerald("http://aeon/mcp", "k", transport=transport),
+                                            since, since + digest.timedelta(days=2))
+    assert [i["id"] for i in items] == ["e0", "e1", "e2"] and complete
 
 
 def test_timeline_stops_when_a_page_brings_nothing_new(monkeypatch):
@@ -656,9 +672,10 @@ def test_timeline_stops_when_a_page_brings_nothing_new(monkeypatch):
     same_time = [{"kind": "episode", "id": f"e{i}", "text": "t", "at": "2026-10-24T00:00:00Z"} for i in range(2)]
     transport, calls = mcp_server(lambda tool, args: {"items": same_time, "from": args["from"], "to": args["to"]})
     since = digest.datetime(2026, 10, 23, tzinfo=digest.timezone.utc)
-    items = digest.timeline_items(digest.Emerald("http://aeon/mcp", "k", transport=transport),
-                                  since, since + digest.timedelta(days=2))
+    items, complete = digest.timeline_items(digest.Emerald("http://aeon/mcp", "k", transport=transport),
+                                            since, since + digest.timedelta(days=2))
     assert [i["id"] for i in items] == ["e0", "e1"] and len(calls) == 2
+    assert not complete  # more than a page share one timestamp: the rest cannot be paged to
 
 
 def test_render_groups_feeds_and_separates_saved_items_from_facts():
@@ -670,3 +687,11 @@ def test_render_groups_feeds_and_separates_saved_items_from_facts():
     assert "## Feeds (FreshRSS, 1 new items)\n\n### Tech\n- A (F) <https://a>\n  s" in text
     assert "## Memory (Aeon, last 24 hours: 1 saved items, 1 new facts)" in text
     assert text.endswith("### New facts\n- Vu prefers X")
+
+
+def test_render_says_when_the_timeline_is_incomplete():
+    digest = load_job("digest_inputs")
+    memory = [{"kind": "episode", "id": "e", "text": "Saved note", "at": "2026-10-24T01:00:00Z"}]
+    assert "Incomplete" not in digest.render([], memory, 24)
+    assert "(Incomplete: Aeon had more for this window than could be read; these are the first 1.)" in \
+        digest.render([], memory, 24, memory_complete=False)
