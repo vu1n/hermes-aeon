@@ -21,7 +21,15 @@ SOURCE_KINDS = frozenset({"text", "transcript", "repository", "document", "tool"
 
 
 class EmeraldError(RuntimeError):
-    """A failed Emerald call, with the tool name and the server's code or HTTP status in the message."""
+    """A failed Emerald call, with the tool name and the server's code or HTTP status in the message.
+
+    ``transient`` marks failures worth retrying later: Emerald unreachable or timing out, HTTP 429 or
+    5xx, or the tool's UNAVAILABLE. ``code`` is the tool's error code (e.g. ``CONFLICT``), if any."""
+
+    def __init__(self, message: str, *, transient: bool = False, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.transient = transient
+        self.code = code
 
 
 class SettingMissing(RuntimeError):
@@ -88,9 +96,10 @@ class Emerald:
         try:
             response = self._http.post(self._url, json=request)
         except httpx.HTTPError as error:
-            raise EmeraldError(f"{tool}: {type(error).__name__}: {error} ({self._url})") from error
+            raise EmeraldError(f"{tool}: {type(error).__name__}: {error} ({self._url})", transient=True) from error
         if response.status_code != 200:
-            raise EmeraldError(f"{tool}: HTTP {response.status_code}: {response.text[:300]}")
+            raise EmeraldError(f"{tool}: HTTP {response.status_code}: {response.text[:300]}",
+                               transient=response.status_code == 429 or response.status_code >= 500)
         try:
             body = _response_message(response, request["id"])
         except ValueError as error:
@@ -102,7 +111,8 @@ class Emerald:
         structured = result.get("structuredContent")
         if result.get("isError"):
             detail = structured or [part.get("text") for part in result.get("content") or []]
-            raise EmeraldError(f"{tool}: {detail}")
+            code = structured.get("code") if isinstance(structured, dict) else None
+            raise EmeraldError(f"{tool}: {detail}", transient=code == "UNAVAILABLE", code=code)
         if not isinstance(structured, dict):
             raise EmeraldError(f"{tool}: result has no structuredContent: {json.dumps(result)[:300]}")
         return structured
@@ -112,7 +122,14 @@ class Emerald:
 
         Re-sending identical content replays the first receipt; changed content is a new version.
         Any other outcome, such as ``rejected_sensitive``, raises EmeraldError."""
-        receipt = self.call("capture", arguments)
+        try:
+            receipt = self.call("capture", arguments)
+        except EmeraldError as error:
+            if error.code != "CONFLICT":
+                raise
+            # The operation id covers the external id and the content, so a conflict means Emerald already
+            # holds this content, sent earlier with other metadata (such as an earlier occurred_at).
+            return {"status": "duplicate", "reason": str(error)}
         if receipt.get("status") not in ("stored", "duplicate"):
             raise EmeraldError(f"capture: {receipt.get('status')}: {receipt.get('reason')}")
         return receipt

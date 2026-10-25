@@ -47,8 +47,17 @@ def event_stream(*messages):
     return httpx.Response(200, text=text, headers={"content-type": "text/event-stream"})
 
 
+class ToolFailure(Exception):
+    """Raised by a fake handler to make the tool fail with Emerald's error ``code``."""
+
+    def __init__(self, code: str, message: str = "failed") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def mcp_server(handler):
-    """A fake Emerald /mcp endpoint: ``handler(tool, arguments)`` returns structured content or raises."""
+    """A fake Emerald /mcp endpoint: ``handler(tool, arguments)`` returns structured content or raises
+    (ToolFailure for a given error code, LookupError for NOT_FOUND)."""
     calls = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -57,10 +66,11 @@ def mcp_server(handler):
         calls.append((params["name"], params["arguments"], request.headers["authorization"]))
         try:
             value = handler(params["name"], params["arguments"])
-        except LookupError as error:
+        except (LookupError, ToolFailure) as error:
+            code = getattr(error, "code", "NOT_FOUND")
             return event_stream({"jsonrpc": "2.0", "id": body["id"], "result": {
-                "isError": True, "content": [{"type": "text", "text": str(error)}],
-                "structuredContent": {"code": "NotFound", "message": str(error)}}})
+                "isError": True, "content": [{"type": "text", "text": f"{code}: {error}"}],
+                "structuredContent": {"code": code, "message": str(error)}}})
         return event_stream({"jsonrpc": "2.0", "id": body["id"], "result": {
             "content": [{"type": "text", "text": json.dumps(value)}], "structuredContent": value}})
 
@@ -99,8 +109,41 @@ def test_call_raises_with_tool_name_on_tool_error():
     def missing(tool, args):
         raise LookupError("no such claim")
     transport, _ = mcp_server(missing)
-    with pytest.raises(client.EmeraldError, match="fetch: .*NotFound"):
+    with pytest.raises(client.EmeraldError, match="fetch: .*NOT_FOUND") as raised:
         client.Emerald("http://aeon/mcp", "k", transport=transport).call("fetch", {"id": "x"})
+    assert raised.value.code == "NOT_FOUND" and not raised.value.transient
+
+
+def _connect_error(request):
+    raise httpx.ConnectError("unreachable", request=request)
+
+
+def _tool_failure(code):
+    def reply(tool, args):
+        raise ToolFailure(code)
+    return mcp_server(reply)[0]
+
+
+@pytest.mark.parametrize("transport, transient", [
+    (httpx.MockTransport(_connect_error), True),
+    (httpx.MockTransport(lambda r: httpx.Response(503, text="down")), True),
+    (httpx.MockTransport(lambda r: httpx.Response(429, text="slow down")), True),
+    (_tool_failure("UNAVAILABLE"), True),
+    (httpx.MockTransport(lambda r: httpx.Response(401, text="unauthorized")), False),
+    (_tool_failure("FORBIDDEN"), False),
+    (_tool_failure("INVALID_INPUT"), False),
+], ids=["unreachable", "503", "429", "UNAVAILABLE", "401", "FORBIDDEN", "INVALID_INPUT"])
+def test_errors_say_whether_a_retry_could_succeed(transport, transient):
+    with pytest.raises(client.EmeraldError) as raised:
+        client.Emerald("http://aeon/mcp", "k", transport=transport).call("capture", {})
+    assert raised.value.transient is transient
+
+
+def test_capture_counts_a_conflict_as_already_stored():
+    # Same operation id (same external id and content), different input: Emerald holds the content.
+    arguments = client.capture_arguments(content="x", kind="text", external_id="x:1")
+    receipt = client.Emerald("http://aeon/mcp", "k", transport=_tool_failure("CONFLICT")).capture(arguments)
+    assert receipt["status"] == "duplicate"
 
 
 @pytest.mark.parametrize("status", ["stored", "duplicate"])
