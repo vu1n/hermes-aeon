@@ -310,51 +310,43 @@ def test_watermark_starts_a_window_back_then_follows_the_newest_crawl(tmp_path):
     assert mark.since(later, 24) == int((later - digest.MAX_FEED_LOOKBACK).timestamp())
 
 
-def test_without_the_password_the_script_reruns_itself_under_tumbler(tmp_path, monkeypatch):
+def test_password_comes_from_the_freshrss_env_file_unless_already_in_the_environment(tmp_path, monkeypatch):
     digest = load_job("digest_inputs")
-    (tmp_path / "token").write_text("tok-123\n")
-    (tmp_path / ".env").write_text(f"TUMBLER_TOKEN_FILE={tmp_path / 'token'}\nTUMBLER_NODE=/n/node\n"
-                                   "TUMBLER_CLI=/t/tumbler\n")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "freshrss.env").write_text("TZ=UTC\nADMIN_API_PASSWORD=from-file\n")
+    (tmp_path / ".env").write_text(f"FRESHRSS_PASSWORD_FILE={tmp_path / 'freshrss.env'}\n"
+                                   "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n")
     monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
-    monkeypatch.delenv(digest.UNDER_TUMBLER, raising=False)
-    runs = []
-    monkeypatch.setattr(digest.subprocess, "run",
-                        lambda command, env, cwd: runs.append((command, env, cwd)) or types.SimpleNamespace(returncode=3))
-    assert digest.main(["--hours", "12"]) == 3
-    command, env, cwd = runs[0]
-    assert command[:6] == ["/n/node", "/t/tumbler", "run", "-k", "FRESHRSS_API_PASSWORD", "--"]
-    assert command[-3:] == [str(PACKAGE / "jobs" / "digest_inputs.py"), "--hours", "12"]
-    assert env["TUMBLER_TOKEN"] == "tok-123" and env[digest.UNDER_TUMBLER] == "1"
-    assert cwd == tmp_path
+    assert digest.freshrss_password(tmp_path) == "from-file"
+    monkeypatch.setenv("FRESHRSS_API_PASSWORD", "from-env")
+    assert digest.freshrss_password(tmp_path) == "from-env"
 
 
-def test_tumbler_without_the_password_is_reported_not_rerun(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("freshrss_env, error", [
+    (None, "not found"),
+    ("TZ=UTC\n", "ADMIN_API_PASSWORD is not set in"),
+])
+def test_missing_password_source_is_reported(tmp_path, monkeypatch, capsys, freshrss_env, error):
     digest = load_job("digest_inputs")
+    if freshrss_env is not None:
+        (tmp_path / "freshrss.env").write_text(freshrss_env)
+    (tmp_path / ".env").write_text(f"FRESHRSS_URL=https://rss\nFRESHRSS_USER=admin\n"
+                                   f"FRESHRSS_PASSWORD_FILE={tmp_path / 'freshrss.env'}\n"
+                                   "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
-    monkeypatch.setenv(digest.UNDER_TUMBLER, "1")
-    monkeypatch.setattr(digest.subprocess, "run", lambda *a, **k: pytest.fail("reran under tumbler again"))
     assert digest.main([]) == 1
-    assert "without FRESHRSS_API_PASSWORD" in capsys.readouterr().err
-
-
-def test_missing_tumbler_token_is_reported(tmp_path, monkeypatch, capsys):
-    digest = load_job("digest_inputs")
-    (tmp_path / ".env").write_text(f"TUMBLER_TOKEN_FILE={tmp_path / 'absent'}\n")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
-    monkeypatch.delenv(digest.UNDER_TUMBLER, raising=False)
-    assert digest.main([]) == 1
-    assert f"no tumbler token at {tmp_path / 'absent'}" in capsys.readouterr().err
+    assert error in capsys.readouterr().err
 
 
 def test_digest_reads_both_sources_and_advances_the_watermark(tmp_path, monkeypatch, capsys):
     digest = load_job("digest_inputs")
+    (tmp_path / "freshrss.env").write_text("ADMIN_API_PASSWORD=pw\n")
     (tmp_path / ".env").write_text("FRESHRSS_URL=https://rss/\nFRESHRSS_USER=admin\n"
+                                   f"FRESHRSS_PASSWORD_FILE={tmp_path / 'freshrss.env'}\n"
+                                   "FRESHRSS_PASSWORD_VAR=ADMIN_API_PASSWORD\n"
                                    "AEON_EMERALD_URL=http://aeon/mcp\nAEON_EMERALD_KEY=k\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("FRESHRSS_API_PASSWORD", "pw")
+    monkeypatch.delenv("FRESHRSS_API_PASSWORD", raising=False)
     pages = {"": {"items": [{"title": "A", "crawlTimeMsec": "1792900000999", "origin": {"title": "F"}}]}}
     rss, real_client = freshrss(pages), httpx.Client
     # Only the FreshRSS client is built without a transport; Emerald's below gets the fake MCP one.

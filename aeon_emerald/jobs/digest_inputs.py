@@ -4,11 +4,11 @@ Its stdout is the material the digest job's prompt summarizes; it does no summar
 Exits 1 with the error on stderr if either source cannot be read, so the digest never silently
 drops a source.
 
-FRESHRSS_API_PASSWORD lives in tumbler and is never written to a file: without it in the
-environment, the script re-runs itself under ``tumbler run -k FRESHRSS_API_PASSWORD``, which puts
-the value in that one child process's environment. FreshRSS is read-only here (the account is
-shared with the owner's own reading); which items were already digested is tracked locally as the
-newest ``crawlTimeMsec`` seen, passed back as ``ot``.
+The FreshRSS API password is never copied to another file: it is read at run time from the FreshRSS
+deployment's own env file (``FRESHRSS_PASSWORD_FILE``, variable ``FRESHRSS_PASSWORD_VAR``) and kept
+in memory, unless ``FRESHRSS_API_PASSWORD`` is already in the environment (e.g. under tumbler).
+FreshRSS is read-only here (the account is shared with the owner's own reading); which items were
+already digested is tracked locally as the newest ``crawlTimeMsec`` seen, passed back as ``ot``.
 
     digest_inputs.py [--hours N]
 """
@@ -18,7 +18,6 @@ import argparse
 import html
 import os
 import re
-import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,12 +26,11 @@ from typing import Any, Optional
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from client import Emerald, EmeraldError, setting  # noqa: E402
+from client import Emerald, EmeraldError, read_env_file, setting  # noqa: E402
 
 GREADER = "/api/greader.php"
 READING_LIST = "/reader/api/0/stream/contents/user/-/state/com.google/reading-list"
 PASSWORD = "FRESHRSS_API_PASSWORD"
-UNDER_TUMBLER = "AEON_EMERALD_UNDER_TUMBLER"
 SNIPPET = 280
 TIMELINE_PAGE = 100
 TIMELINE_PAGES = 10
@@ -48,22 +46,17 @@ def _plain(markup: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", markup or ""))).strip()
 
 
-def rerun_under_tumbler(home: Path, argv: list[str]) -> int:
-    """Run this script again under ``tumbler run`` so the FreshRSS password reaches only that child."""
-    if os.environ.get(UNDER_TUMBLER):
-        raise SourceError(f"tumbler ran the digest without {PASSWORD}; check the token's pin with `tumbler keys`")
-    token_file = Path(setting("TUMBLER_TOKEN_FILE", home))
-    try:
-        token = token_file.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        raise SourceError(f"no tumbler token at {token_file}") from None
-    if not token:
-        raise SourceError(f"tumbler token file {token_file} is empty")
-    # Hermes scrubs secrets from cron script environments, so the token is added back for tumbler only.
-    env = {**os.environ, "TUMBLER_TOKEN": token, UNDER_TUMBLER: "1"}
-    command = [setting("TUMBLER_NODE", home), setting("TUMBLER_CLI", home), "run", "-k", PASSWORD, "--",
-               sys.executable, str(Path(__file__).resolve()), *argv]
-    return subprocess.run(command, env=env, cwd=home).returncode
+def freshrss_password(home: Path) -> str:
+    """The API password, held only in memory: from the environment, else the FreshRSS deployment's env file."""
+    if os.environ.get(PASSWORD):
+        return os.environ[PASSWORD]
+    source, variable = Path(setting("FRESHRSS_PASSWORD_FILE", home)), setting("FRESHRSS_PASSWORD_VAR", home)
+    if not source.is_file():
+        raise SourceError(f"FreshRSS env file {source} not found")
+    password = read_env_file(source).get(variable)
+    if not password:
+        raise SourceError(f"{variable} is not set in {source}")
+    return password
 
 
 def freshrss_items(http: httpx.Client, base: str, user: str, password: str, since: int) -> list[dict[str, Any]]:
@@ -169,11 +162,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     until = datetime.now(timezone.utc)
     watermark = Watermark(home / "aeon-emerald" / "freshrss-watermark")
     try:
-        if not os.environ.get(PASSWORD):
-            return rerun_under_tumbler(home, argv)
         with httpx.Client(timeout=30.0) as http:
             feeds = freshrss_items(http, setting("FRESHRSS_URL", home).rstrip("/"), setting("FRESHRSS_USER", home),
-                                   os.environ[PASSWORD], watermark.since(until, args.hours))
+                                   freshrss_password(home), watermark.since(until, args.hours))
         emerald = Emerald.from_settings(home, "AEON_EMERALD_KEY")
         try:
             memory = timeline_items(emerald, until - timedelta(hours=args.hours), until)
