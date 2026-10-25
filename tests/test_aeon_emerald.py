@@ -10,10 +10,10 @@ import httpx
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKAGE = ROOT / "aeon_emerald"
+PACKAGE = ROOT
 
-client = importlib.import_module("hermes_aeon.aeon_emerald.client")
-session = importlib.import_module("hermes_aeon.aeon_emerald.session")
+client = importlib.import_module("aeon_emerald.client")
+session = importlib.import_module("aeon_emerald.session")
 
 
 @pytest.fixture
@@ -30,8 +30,8 @@ def provider(monkeypatch):
         constants = types.ModuleType("hermes_constants")
         constants.get_hermes_home = lambda: Path("/nonexistent-hermes-home")
         monkeypatch.setitem(sys.modules, "hermes_constants", constants)
-    monkeypatch.delitem(sys.modules, "hermes_aeon.aeon_emerald.provider", raising=False)
-    return importlib.import_module("hermes_aeon.aeon_emerald.provider")
+    monkeypatch.delitem(sys.modules, "aeon_emerald.provider", raising=False)
+    return importlib.import_module("aeon_emerald.provider")
 
 
 def load_job(name):

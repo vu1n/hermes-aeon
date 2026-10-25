@@ -1,6 +1,0 @@
-name: aeon-emerald
-version: 0.1.0
-description: "Saves each ended Hermes session to Aeon Emerald as a transcript. Recall goes through the aeon MCP server, not this provider."
-author: vu1n
-pip_dependencies:
-  - httpx
