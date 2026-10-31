@@ -1,20 +1,6 @@
-name: hermes-aeon
-version: 0.2.0
-description: "Aeon memory provider for Hermes — libSQL-backed personal KB with 7 domains × 10 types, hybrid vector+FTS search, append-only revisions, and a 5-axis tone codec. General memory runs through the agent-neutral brain.general.v1 gateway (in-process trusted adapter, or socket client like every other bot)."
+name: aeon-emerald
+version: 0.1.0
+description: "Saves each ended Hermes session to Aeon Emerald as a transcript. Recall goes through the aeon MCP server, not this provider."
 author: vu1n
-# Explicit kind=standalone bypasses the auto-coerce-to-exclusive heuristic
-# (triggered by `MemoryProvider` text in __init__.py) so the general plugin
-# manager ALSO loads us. Memory discovery loads us in parallel via its own
-# scan; register(ctx) routes by ctx capabilities (see __init__.py).
-kind: standalone
-hooks:
-  - on_session_end
-  - pre_llm_call
-# libsql-experimental removed 2026-10-06: uv built it from sdist for the bundled
-# Python 3.14.7 runtime (no cp314 wheel exists upstream) and that binary segfaults
-# in PyNumber_Index on FTS MATCH / fetchall — killed every aeon cron worker and
-# crashed the gateway. store/db.py falls back to stdlib sqlite3 (FTS5 hybrid search
-# works; vector_distance_cos ranking is a no-op). Re-add only when upstream ships a
-# working cp314/abi3 wheel.
 pip_dependencies:
   - httpx

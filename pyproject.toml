@@ -1,21 +1,15 @@
 [project]
 name = "hermes-aeon"
-version = "0.2.0"
-description = "Aeon memory provider for Hermes-Agent."
+version = "0.3.0"
+description = "Hermes plugin for Aeon Emerald: saves ended sessions as transcripts, plus the Oura and digest cron jobs."
 requires-python = ">=3.10"
 dependencies = [
-    # libsql-experimental dropped 2026-10-06: uv builds it from sdist on the bundled
-    # Python 3.14.7 (no cp314 wheel upstream) and that binary segfaults in
-    # PyNumber_Index on FTS MATCH/fetchall. store/db.py falls back to stdlib sqlite3
-    # (FTS5 hybrid search works; vector ranking becomes a no-op). Re-add only when
-    # upstream ships a working cp314/abi3 wheel.
     "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
 ]
 
 [tool.pytest.ini_options]

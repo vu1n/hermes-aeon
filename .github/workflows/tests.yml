@@ -5,26 +5,17 @@ on:
 permissions:
   contents: read
 jobs:
-  synthetic-tests:
+  tests:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.10', '3.12']
-        backend: [sqlite, libsql]
+        # 3.14 is what Hermes runs; 3.10 is the floor in pyproject.toml.
+        python: ['3.10', '3.14']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install pytest
-      - if: matrix.backend == 'libsql'
-        run: python -m pip install 'libsql-experimental>=0.0.40'
-      - name: Transaction, broker, projection and migration tests
-        run: python -m unittest discover -s aeon_sharedwrites -v
-      - name: Existing read adapter tests
-        run: python -m unittest discover -s aeon_readonly -v
-      - name: Aeon Brain MCP tests
-        run: python -m unittest discover -s aeon_brain -v
-      - name: Plugin tests
-        run: python -m pytest -q
+      - run: python -m pip install pytest httpx
+      - run: python -m pytest -q

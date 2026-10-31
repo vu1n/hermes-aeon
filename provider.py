@@ -1,805 +1,132 @@
-"""AeonMemoryProvider — bundles personal-KB recall, tone codec, and auto-capture for Hermes."""
+"""Capture-only memory provider: each ended Hermes session is saved to Aeon Emerald as a transcript.
+
+Recall is not done here. Hermes reaches Emerald's tools through its ``aeon`` MCP server entry; this
+provider exists because only memory providers receive the full transcript at a real session end
+(the plugin ``on_session_end`` hook fires per turn, and ``on_session_finalize`` gets only an id).
+"""
 from __future__ import annotations
 
-import hashlib
 import logging
-import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
-from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_home
-from tools.registry import tool_error, tool_result
-from utils import atomic_yaml_write
 
-from .store.db import AeonDB
-from .store import queries as q
-from .store.embed import embed_text
-from .tone.codec import AXES, PRESETS, apply_axes, apply_preset
-from .tone.state import ToneStore
-from .tools.browser_providers import jina
+from .client import Emerald, Ledger, SettingMissing, setting
+from .session import Spool, drain, session_captures
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Tool schemas
-# ---------------------------------------------------------------------------
-
-DOMAINS = sorted(q.VALID_DOMAINS)
-TYPES = sorted(q.VALID_TYPES)
-TONE_PRESET_NAMES = sorted(PRESETS.keys())
-
-# brain.general.v1 scope (brain_service.policy.DOMAINS); mirrors the neutral
-# client surface other agents use. Imports the policy lazily in handlers —
-# keep module import light under the Hermes host.
-GENERAL_DOMAINS = frozenset({"work", "learning", "side_projects"})
-_GENERAL_STATEMENT_LIMIT = 100_000  # brain_service.service.bounded_text bound
-
-_DOMAIN_FIELD = {"type": "string", "enum": DOMAINS}
-_TYPE_FIELD = {"type": "string", "enum": TYPES}
-_MEMORY_ID_FIELD = {"type": "string", "pattern": "^[a-f0-9]{32}$"}
-
-CAPTURE_SCHEMA = {
-    "name": "aeon_capture",
-    "description": (
-        "Save a memory to the personal knowledge base. Use for notes, links, "
-        "calendar events, contacts, health logs, files. Pass `url` to extract "
-        "and store a webpage; pass `content` for raw text. Always picks a domain "
-        "and type — no inbox dumping. Plain notes in work/learning/side_projects "
-        "are stored as general brain assertions shared with other agents; other "
-        "shapes stay in the canonical local store. Captures are idempotent: "
-        "retrying the identical payload returns the original receipt."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "domain": _DOMAIN_FIELD,
-            "type": _TYPE_FIELD,
-            "content": {"type": "string", "description": "Raw text. Required if url is absent."},
-            "url": {"type": "string", "description": "If present, extracted via configured extractor."},
-            "title": {"type": "string"},
-            "summary": {"type": "string"},
-            "tags": {"type": "array", "items": {"type": "string"}, "description": "Stored as general topics for general captures."},
-            "project_id": {"type": "string"},
-            "record_class": {"type": "string", "enum": ["assertion", "working_context"],
-                             "description": "General captures only. working_context expires after 14 days unless expires_at is set."},
-            "event_start_ms": {"type": "integer", "description": "Unix ms; for calendar_event."},
-            "event_end_ms": {"type": "integer"},
-        },
-        "required": ["domain", "type"],
-    },
-}
-
-SEARCH_SCHEMA = {
-    "name": "aeon_search",
-    "description": "General-only lexical recall. Filter by domain, topic, source, type or project; records remain source claims.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string"},
-            "domain": {"type":"string","enum":["work","learning","side_projects"]},
-            "type": _TYPE_FIELD,
-            "project_id": {"type": "string"},
-            "topic": {"type":"string"},
-            "source": {"type":"string"},
-            "record_class": {"type":"string","enum":["evidence","assertion","working_context","derived_view"]},
-            "limit": {"type": "integer", "default": 10},
-        },
-        "required": ["query"],
-    },
-}
-
-CALENDAR_SCHEMA = {
-    "name": "aeon_calendar",
-    "description": "Unavailable in the general foundation until calendar lineage is supported.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "start_ms": {"type": "integer"},
-            "end_ms": {"type": "integer"},
-            "domain": _DOMAIN_FIELD,
-            "limit": {"type": "integer", "default": 50},
-        },
-        "required": ["start_ms", "end_ms"],
-    },
-}
-
-UPDATE_SCHEMA = {
-    "name": "aeon_update",
-    "description": (
-        "Append a revision to an existing memory. Tracks how a concept evolves over time. "
-        "Only the capturing agent can revise a general record; retries of the identical "
-        "edit return the original receipt instead of a new revision."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "memory_id": _MEMORY_ID_FIELD,
-            "expected_revision": {"type": "integer", "minimum": 1},
-            "content": {"type": "string"},
-            "summary": {"type": "string"},
-            "source": {"type": "string"},
-        },
-        "required": ["memory_id", "content", "expected_revision"],
-    },
-}
-
-GET_SCHEMA = {
-    "name": "aeon_get",
-    "description": (
-        "Fetch one general memory by id with full provenance (capturing/editing actor, "
-        "record class, topics, evidence refs). Returns found=false for retracted, "
-        "expired or restricted records — never a stale copy."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {"memory_id": _MEMORY_ID_FIELD},
-        "required": ["memory_id"],
-    },
-}
-
-PROPOSE_SCHEMA = {
-    "name": "aeon_propose",
-    "description": (
-        "Disagree safely: propose a separate contradicting assertion linked to another "
-        "agent's record without overwriting it. Cross-agent corrections never rewrite "
-        "another agent's statement."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "memory_id": _MEMORY_ID_FIELD,
-            "expected_revision": {"type": "integer", "minimum": 1,
-                                  "description": "Revision of the target you are responding to."},
-            "statement": {"type": "string", "description": "Your competing claim."},
-            "reason": {"type": "string"},
-        },
-        "required": ["memory_id", "expected_revision", "statement", "reason"],
-    },
-}
-
-RETRACT_SCHEMA = {
-    "name": "aeon_retract",
-    "description": (
-        "Withdraw one of your own general records. Appends a retracted revision; the "
-        "record immediately disappears from recall. You cannot retract other agents' records."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "memory_id": _MEMORY_ID_FIELD,
-            "expected_revision": {"type": "integer", "minimum": 1},
-            "reason": {"type": "string"},
-        },
-        "required": ["memory_id", "expected_revision", "reason"],
-    },
-}
-
-STATUS_SCHEMA = {
-    "name": "aeon_status",
-    "description": (
-        "Report the general brain service contract: api/policy versions, commit and "
-        "index sequences. Use to check that writes are visible before searching."
-    ),
-    "parameters": {"type": "object", "properties": {}},
-}
-
-SET_TONE_SCHEMA = {
-    "name": "aeon_set_tone",
-    "description": (
-        "Adjust the agent's voice for this session. Pass a preset name OR explicit axes "
-        "(any subset of warmth/directness/structure/evidence/playfulness on [0,1]). "
-        "Weight controls how strongly to blend toward the target (0 = no change, 1 = replace)."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "preset": {"type": "string", "enum": TONE_PRESET_NAMES},
-            "axes": {
-                "type": "object",
-                "properties": {a: {"type": "number"} for a in AXES},
-            },
-            "weight": {"type": "number", "default": 0.7},
-        },
-    },
-}
-
-GET_TONE_SCHEMA = {
-    "name": "aeon_get_tone",
-    "description": "Return the current 5-axis tone state for this session.",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-# ---------------------------------------------------------------------------
-# Pull / refresh tool schemas — agent can trigger fetchers in chat;
-# cron prompts call these via prompt-mode rather than --script files.
-# ---------------------------------------------------------------------------
-
-PULL_BOOKMARKS_SCHEMA = {
-    "name": "aeon_pull_bookmarks",
-    "description": "Pull new X bookmarks via xurl. Captures each as memory_item (source=x-bookmark). Pass backfill=true for paginated all-history pull (first run only).",
-    "parameters": {"type": "object", "properties": {
-        "backfill": {"type": "boolean", "default": False},
-    }},
-}
-
-PULL_GITHUB_SCHEMA = {
-    "name": "aeon_pull_github",
-    "description": "Pull recent GitHub events (commits, PRs, reviews, comments, releases, stars). Captured at original event time.",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-PULL_RSS_SCHEMA = {
-    "name": "aeon_pull_rss",
-    "description": "Pull HN frontpage + Lobste.rs RSS, LLM-score each new item vs interest profile, capture above threshold (default 0.6) with quality_score.",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-PULL_X_SCHEMA = {
-    "name": "aeon_pull_x",
-    "description": "Search X via twitterapi.io using topics derived from interest profile, score each vs profile, capture above threshold (default 0.7).",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-PULL_HF_PAPERS_SCHEMA = {
-    "name": "aeon_pull_hf_papers",
-    "description": "Pull Hugging Face daily papers, score vs profile, capture above threshold (default 0.55).",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-PULL_HYPE_SCHEMA = {
-    "name": "aeon_pull_hype",
-    "description": "Pull hype.replicate.dev cross-platform AI/ML engagement firehose (GitHub/HF/Reddit/Replicate), score, capture above threshold (default 0.6).",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-DIGEST_SCHEMA = {
-    "name": "aeon_digest",
-    "description": "Synthesize a daily readout from eligible general discoveries, GitHub work, and recent bookmarks. Returns {text, totals, window_hours}. The text is Telegram-markdown ready.",
-    "parameters": {"type": "object", "properties": {
-        "hours": {"type": "integer", "default": 24, "description": "Time window for the digest (default 24h)."},
-    }},
-}
-
-RECENT_SCHEMA = {
-    "name": "aeon_recent",
-    "description": (
-        "Time-windowed list of recent items from the personal KB, sorted by "
-        "quality_score (highest first) by default. Use for 'show me today / "
-        "this week's discoveries / top picks / what came in from HN' style "
-        "queries. Paginated via offset+limit; returns total + has_more so the "
-        "agent can offer to page further."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "hours": {"type": "integer", "default": 24,
-                      "description": "Time window in hours. Common: 24 (today), 72 (3d), 168 (week), 720 (30d)."},
-            "limit": {"type": "integer", "default": 20,
-                      "description": "Max items per page (capped at 100)."},
-            "offset": {"type": "integer", "default": 0,
-                       "description": "Pagination offset. Pass next_offset from previous response to page."},
-            "min_score": {"type": "number",
-                          "description": "Filter to scored items with quality_score >= this (e.g. 0.7 = strong matches only). Omit to include unscored items (bookmarks, github events)."},
-            "source": {"type": "string",
-                       "description": "Source prefix filter. Examples: 'discover:' (all discoveries), 'discover:hn', 'discover:x', 'discover:hf-papers', 'github:', 'x-bookmark'."},
-            "domain": _DOMAIN_FIELD,
-            "type": _TYPE_FIELD,
-            "record_class": {"type":"string","enum":["evidence","assertion","working_context","derived_view"]},
-            "order": {"type": "string", "enum": ["score", "captured_at"], "default": "score",
-                      "description": "score: highest quality first (unscored items go last). captured_at: most recent first."},
-        },
-    },
-}
+Saved = Tuple[str, List[Dict[str, Any]], str]  # session id, transcript, when it ended (ISO 8601, UTC)
 
 
-# ---------------------------------------------------------------------------
-# Provider
-# ---------------------------------------------------------------------------
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def _load_plugin_config() -> dict:
-    try:
-        import yaml
-        cfg_path = get_hermes_home() / "config.yaml"
-        if not cfg_path.exists():
-            return {}
-        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
-        return cfg_get(data, "plugins", "hermes-aeon", default={}) or {}
-    except Exception:
-        return {}
+KEY_SETTING = "AEON_EMERALD_KEY"
+PROMPT = (
+    "Long-term memory lives in Aeon, reached through the `aeon` MCP tools and shared with the "
+    "owner's other assistants. Search it before answering about the owner's past work, decisions, "
+    "people or plans; use `context` for a briefing on a task, and `capture` when the owner asks you "
+    "to remember something. Finished conversations are saved to Aeon automatically, so never capture "
+    "the conversation itself."
+)
 
 
-class AeonMemoryProvider(MemoryProvider):
-    def __init__(self, config: Optional[dict] = None):
-        self._config = config or _load_plugin_config()
-        self._db: Optional[AeonDB] = None
-        self._tone: Optional[ToneStore] = None
-        self._session_id: str = ""
-        self._hermes_home: Path = get_hermes_home()
-        self._embed_provider: str = self._config.get("embed_provider", "gemini")
-        # Only jina is implemented today; firecrawl support would land alongside its provider wrapper.
-        self._extractor: str = self._config.get("extractor", "jina")
-        self._auto_extract: bool = bool(self._config.get("auto_extract", True))
-        # brain.general.v1 transport. Empty -> the trusted in-process adapter
-        # (Gateway over our canonical DB, the historical behavior). Set -> this
-        # plugin is a plain gateway client like every other bot; general ops go
-        # over the socket and fail closed (never a canonical-DB fallback).
-        self._general_socket: str = str(self._config.get("general_socket", "") or "").strip()
-        self._client = None
-        self._gateway = None
-        self._handlers: Dict[str, Any] = {}
+class EmeraldSessionProvider(MemoryProvider):
+    def __init__(self) -> None:
+        self._home: Path = Path()
+        self._session_id = ""
+        self._platform = ""
+        self._writes = False
+        # (session id, transcript, when) as of the last turn, until that session is saved.
+        self._latest: Optional[Saved] = None
 
     @property
     def name(self) -> str:
-        return "hermes-aeon"
+        return "aeon-emerald"
 
     def is_available(self) -> bool:
+        try:
+            setting("AEON_EMERALD_URL", get_hermes_home())
+            setting(KEY_SETTING, get_hermes_home())
+        except SettingMissing:
+            return False
         return True
 
-    def get_config_schema(self) -> List[Dict[str, Any]]:
-        return [
-            {"key": "db_path", "description": "libSQL database path", "default": "$HERMES_HOME/aeon.db"},
-            {"key": "general_socket", "description": "brain.general.v1 gateway socket; empty uses the trusted in-process adapter", "default": ""},
-            {"key": "embed_provider", "description": "Embedding backend", "default": "gemini", "choices": ["gemini", "none"]},
-            {"key": "extractor", "description": "URL content extractor", "default": "jina", "choices": ["jina"]},
-            {"key": "auto_extract", "description": "Auto-extract memories on session end", "default": "true", "choices": ["true", "false"]},
-            {"key": "turso_url", "description": "Turso sync URL (optional)", "secret": False, "env_var": "HERMES_AEON_TURSO_URL"},
-            {"key": "turso_token", "description": "Turso auth token", "secret": True, "env_var": "HERMES_AEON_TURSO_TOKEN"},
-        ]
+    def unavailable_reason(self) -> str:
+        return f"set AEON_EMERALD_URL and {KEY_SETTING} in the profile's .env"
 
-    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        try:
-            import yaml
-            cfg_path = Path(hermes_home) / "config.yaml"
-            existing = {}
-            if cfg_path.exists():
-                existing = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig")) or {}
-            existing.setdefault("plugins", {})
-            existing["plugins"]["hermes-aeon"] = values
-            atomic_yaml_write(cfg_path, existing)
-        except Exception as e:
-            logger.warning("save_config failed: %s", e)
-
-    def initialize(self, session_id: str, **kwargs) -> None:
-        hermes_home = Path(kwargs.get("hermes_home") or get_hermes_home())
-        self._hermes_home = hermes_home
-        db_path = self._config.get("db_path", str(hermes_home / "aeon.db"))
-        if isinstance(db_path, str):
-            db_path = db_path.replace("$HERMES_HOME", str(hermes_home))
-            db_path = db_path.replace("${HERMES_HOME}", str(hermes_home))
-
-        self._db = AeonDB(
-            db_path=db_path,
-            turso_url=self._config.get("turso_url"),
-            turso_token=self._config.get("turso_token"),
-        )
-        self._db.connect()
-        self._db.bootstrap_schema()
-
-        tone_path = hermes_home / "hermes-aeon" / "tone.json"
-        self._tone = ToneStore(tone_path)
+    def initialize(self, session_id: str, **kwargs: Any) -> None:
+        self._home = Path(kwargs.get("hermes_home") or get_hermes_home())
         self._session_id = session_id
-        if self._general_socket:
-            from .brain_service.client import Client
-            self._client = Client(self._general_socket)
-        else:
-            # Same Gateway/Service boundary the socket server uses, driven
-            # in-process under the trusted hermes principal.
-            from .brain_service.gateway import Gateway
-            from .brain_service.policy import HERMES
-            self._gateway = Gateway(self._db, principals={"hermes": HERMES}, peer_bindings={0: "hermes"})
-        self._handlers = {
-            "aeon_capture": self._handle_capture,
-            "aeon_search": self._handle_search,
-            "aeon_calendar": self._handle_calendar,
-            "aeon_recent": self._handle_recent,
-            "aeon_update": self._handle_update,
-            "aeon_get": self._handle_get,
-            "aeon_propose": self._handle_propose,
-            "aeon_retract": self._handle_retract,
-            "aeon_status": self._handle_status,
-            "aeon_set_tone": self._handle_set_tone,
-            "aeon_get_tone": self._handle_get_tone,
-            # Ingest tools — agent-triggerable fetchers
-            "aeon_pull_bookmarks": self._handle_pull_bookmarks,
-            "aeon_pull_github": self._handle_pull_github,
-            "aeon_pull_oura": self._handle_pull_oura,
-            "aeon_pull_rss": self._handle_pull_rss,
-            "aeon_pull_x": self._handle_pull_x,
-            "aeon_pull_hf_papers": self._handle_pull_hf_papers,
-            "aeon_pull_hype": self._handle_pull_hype,
-            "aeon_derive_profile": self._handle_derive_profile,
-            "aeon_digest": self._handle_digest,
-        }
-
-    # -- brain.general.v1 transport ------------------------------------------
-
-    def _general_call(self, operation: str, arguments: dict) -> dict:
-        """One brain.general.v1 request; returns the {ok, result|error} envelope.
-
-        Socket mode fails closed: Invalid/Unavailable from the client become
-        error envelopes, never a canonical-DB fallback (mirrors the MCP
-        --general-socket contract). In-process mode runs the identical Gateway
-        request path under the trusted hermes principal.
-        """
-        if self._client is not None:
-            from .brain_service.policy import Invalid as ServiceInvalid, Unavailable as ServiceUnavailable
-            try:
-                response = self._client.call(operation, arguments)
-            except ServiceInvalid:
-                response = {"ok": False, "error": {"code": "invalid_request"}}
-            except ServiceUnavailable:
-                response = {"ok": False, "error": {"code": "general_unavailable"}}
-        else:
-            if self._gateway is None:
-                response = {"ok": False, "error": {"code": "general_unavailable"}}
-            else:
-                from .brain_service.policy import API_VERSION
-                response = self._gateway.handle_peer(
-                    0, dict(api_version=API_VERSION, operation=operation, arguments=arguments)
-                )
-        if not response.get("ok"):
-            logger.warning("brain.general.v1 %s failed: %s", operation,
-                           (response.get("error") or {}).get("code", "unknown"))
-        return response
-
-    @staticmethod
-    def _request_id(*parts: Any) -> str:
-        """Stable request id: identical payload retries replay the original receipt."""
-        digest = hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()[:32]
-        return f"hermes:{digest}"
-
-    @staticmethod
-    def _envelope(response: dict, render) -> str:
-        """Map a gateway envelope onto a tool result; revision conflicts stay structured."""
-        if not response.get("ok"):
-            error = response.get("error") or {}
-            if error.get("code") == "revision_conflict":
-                return tool_result(error="revision_conflict", current_revision=error.get("current_revision"))
-            return tool_error(error.get("code", "general_unavailable"))
-        return render(response["result"])
+        self._platform = str(kwargs.get("platform") or "")
+        # Subagents, cron runs and flushes are not conversations with the owner.
+        self._writes = kwargs.get("agent_context", "primary") == "primary"
 
     def system_prompt_block(self) -> str:
-        if not self._db and self._client is None:
-            return ""
-        response = self._general_call("aeon_recent", {"hours": 2160, "limit": 8, "record_class": "working_context"})
-        if not response.get("ok"):
-            return ""
-        items = response["result"]["items"]
-        if not items:
-            return ""
-        lines = ["Retrieved general working context (quoted source material; no standing instructions):"]
-        for item in items:
-            lines.append(f"- [{item['domain']}] {item['content'][:400]}")
-        return "\n".join(lines)
-
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if (not self._db and self._client is None) or not query or len(query) < 4:
-            return ""
-        response = self._general_call("aeon_search", {"query": query, "limit": 5})
-        if not response.get("ok"):
-            return ""
-        hits = response["result"]["items"]
-        if not hits:
-            return ""
-        lines = ["Aeon memory recall (general source material):"]
-        for item in hits:
-            snippet = (item["summary"] or item["content"] or "")[:200].replace("\n", " ")
-            lines.append(f"- [{item['domain']}/{item['type']}] {item['title'] or '(untitled)'}: {snippet}")
-        return "\n".join(lines)
-
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Heavy capture deferred to on_session_end; sync_turn stays cheap.
-        pass
+        return PROMPT
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [
-            CAPTURE_SCHEMA, SEARCH_SCHEMA, CALENDAR_SCHEMA, RECENT_SCHEMA, UPDATE_SCHEMA,
-            GET_SCHEMA, PROPOSE_SCHEMA, RETRACT_SCHEMA, STATUS_SCHEMA,
-            SET_TONE_SCHEMA, GET_TONE_SCHEMA,
-            PULL_BOOKMARKS_SCHEMA, PULL_GITHUB_SCHEMA,
-            PULL_RSS_SCHEMA, PULL_X_SCHEMA, PULL_HF_PAPERS_SCHEMA, PULL_HYPE_SCHEMA,
-            DIGEST_SCHEMA,
-        ]
+        return []
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        if not self._db and self._client is None:
-            return tool_error("aeon provider not initialized")
-        handler = self._handlers.get(tool_name)
-        if handler is None:
-            return tool_error(f"unknown tool: {tool_name}")
-        try:
-            return handler(args)
-        except KeyError as e:
-            return tool_error(f"missing argument: {e}")
-        except Exception as e:
-            logger.exception("aeon tool error")
-            return tool_error(str(e))
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  messages: Optional[List[Dict[str, Any]]] = None, **kwargs: Any) -> None:
+        # Hermes passes the redacted transcript after each turn, off the main thread, so it can arrive
+        # after a switch: it keeps the id of the session it belongs to.
+        if messages is not None:
+            self._latest = (session_id or self._session_id, list(messages), _now())
+
+    def on_session_switch(self, new_session_id: str, **kwargs: Any) -> None:
+        # /resume and /branch leave a session without on_session_end; /new and compaction end it first,
+        # which clears the snapshot. A rewind keeps the id: its snapshot holds turns the user undid, so it
+        # is dropped. The new id is taken first, so a failed save cannot leave the next session's
+        # transcript filed under the old id.
+        snapshot, self._latest = self._latest, None
+        self._session_id = new_session_id
+        if snapshot and snapshot[0] != new_session_id:
+            self._save([snapshot])
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._auto_extract or not self._db or not messages:
-            return
-        self._auto_extract_from_transcript(messages)
-        self._db.sync()
+        snapshot, self._latest = self._latest, None
+        # A late turn of a session already left still belongs to that session.
+        stale = [snapshot] if snapshot and snapshot[0] != self._session_id else []
+        self._save([*stale, (self._session_id, messages, _now())])
 
     def shutdown(self) -> None:
-        if self._db:
-            self._db.sync()
-            self._db.close()
-        self._db = None
+        # Hermes also releases an agent without ending its session (a /reasoning, /fast, /personality,
+        # /moa or model change), and a later exit does not end it either. A transcript not yet saved is
+        # spooled here but not sent, which would hold up the command; the next session end sends it.
+        snapshot, self._latest = self._latest, None
+        if snapshot:
+            self._save([snapshot], send=False)
 
-    # -- Tool handlers ------------------------------------------------------
-
-    @staticmethod
-    def _derive_title_summary(extracted: str, url: str, title: Optional[str], summary: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-        if not title:
-            first_line = next((ln for ln in extracted.splitlines() if ln.strip()), "")
-            title = first_line.lstrip("# ").strip()[:200] or url
-        if not summary:
-            summary = extracted[:400].replace("\n", " ").strip()
-        return title, summary
-
-    def _capture_is_general(self, domain: str, type_: str, url, content) -> bool:
-        """Plain notes inside the general scope go through brain.general.v1; URL
-        extractions, calendar/task/link shapes and other domains stay canonical
-        (imported evidence via the Hermes compatibility hook)."""
-        return (
-            type_ == "note"
-            and not url
-            and isinstance(content, str)
-            and 0 < len(content) <= _GENERAL_STATEMENT_LIMIT
-            and domain in GENERAL_DOMAINS
-        )
-
-    def _handle_capture(self, args: dict) -> str:
-        domain = args["domain"]
-        type_ = args["type"]
-        url = args.get("url")
-        content = args.get("content")
-        title = args.get("title")
-        summary = args.get("summary")
-
-        if url and not content:
-            extracted = jina.extract(url) if self._extractor == "jina" else None
-            if extracted:
-                content = extracted
-                title, summary = self._derive_title_summary(extracted, url, title, summary)
-            else:
-                content = url
-
-        if not content and not url:
-            return tool_error("aeon_capture requires content or url")
-
-        if self._capture_is_general(domain, type_, url, content):
-            record_class = args.get("record_class") or "assertion"
-            gateway_args = {
-                "request_id": self._request_id("capture", domain, content, title, summary,
-                                               tuple(sorted(args.get("tags") or [])),
-                                               args.get("project_id"), record_class),
-                "domain": domain,
-                "statement": content,
-                "record_class": record_class,
-                "topics": args.get("tags") or [],
-            }
-            if title:
-                gateway_args["title"] = title[:300]
-            if summary:
-                gateway_args["summary"] = summary[:2000]
-            if args.get("project_id"):
-                gateway_args["project_id"] = args["project_id"]
-            response = self._general_call("aeon_capture", gateway_args)
-            return self._envelope(response, lambda result: tool_result(
-                id=result["memory_id"], status="captured",
-                revision=result.get("revision", 1),
-                search_visibility=result.get("search_visibility")))
-
-        source = args.get("source") or ("manual" if not url else self._extractor)
-        dedup_key = "url:" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] if url else None
-        emb, model = embed_text(
-            (title or "") + "\n" + (summary or content or ""),
-            provider=self._embed_provider,
-        )
-        mid = q.capture_memory(
-            self._db,
-            type=type_, domain=domain, title=title, summary=summary, content=content,
-            url=url, tags=args.get("tags") or [], project_id=args.get("project_id"),
-            source=source,
-            event_start=args.get("event_start_ms"), event_end=args.get("event_end_ms"),
-            dedup_key=dedup_key, embedding=emb, embedding_model=model,
-        )
-        return tool_result(id=mid, status="captured", embedded=emb is not None)
-
-    def _handle_search(self, args: dict) -> str:
-        query_args = {"query": args["query"], "limit": args.get("limit", 10)}
-        for field in ("domain", "type", "project_id", "source", "topic", "record_class",
-                      "min_commit_sequence"):
-            if args.get(field) is not None:
-                query_args[field] = args[field]
-        response = self._general_call("aeon_search", query_args)
-        return self._envelope(response, lambda result: tool_result(
-            results=result["items"], count=result["count"],
-            indexed_sequence=result["indexed_sequence"],
-            indexing_pending=result.get("indexing_pending", False)))
-
-    def _handle_calendar(self, args: dict) -> str:
-        return tool_error('General calendar recall is unavailable until classified revision lineage is supported')
-
-    def _handle_recent(self, args: dict) -> str:
-        recent_args = {"hours": args.get("hours", 24), "limit": args.get("limit", 20),
-                       "offset": args.get("offset", 0), "order": args.get("order", "score")}
-        for field in ("min_score", "source", "domain", "type", "topic", "project_id",
-                      "record_class"):
-            if args.get(field) is not None:
-                recent_args[field] = args[field]
-        response = self._general_call("aeon_recent", recent_args)
-        def render(result):
-            now = q.now_ms()
-            items = [dict(item, snippet=(item["summary"] or item["content"] or "")[:200],
-                          age_hours=round((now - item["captured_at"]) / 3600000, 1))
-                     for item in result["items"]]
-            return tool_result(**dict(result, items=items, window_hours=recent_args["hours"]))
-        return self._envelope(response, render)
-
-    def _handle_update(self, args: dict) -> str:
-        if type(args.get("expected_revision")) is not int or args["expected_revision"] < 1:
-            return tool_error("expected_revision is required; read the memory before updating")
-        # The aeon_correct alias maps this legacy shape onto a typed revision;
-        # the derived request_id makes identical retries replay their receipt.
-        response = self._general_call("aeon_correct", {
-            "request_id": self._request_id("update", args["memory_id"],
-                                           args["expected_revision"], args["content"],
-                                           args.get("summary")),
-            "memory_id": args["memory_id"],
-            "expected_revision": args["expected_revision"],
-            "statement": args["content"],
-            **({"summary": args["summary"]} if args.get("summary") else {}),
-        })
-        return self._envelope(response, lambda result: tool_result(
-            memory_id=args["memory_id"], revision=result["revision"]))
-
-    def _handle_get(self, args: dict) -> str:
-        response = self._general_call("get", {"id": args["memory_id"]})
-        return self._envelope(response, lambda result: tool_result(
-            found=result["item"] is not None, item=result["item"]))
-
-    def _handle_propose(self, args: dict) -> str:
-        response = self._general_call("propose", {
-            "request_id": self._request_id("propose", args["memory_id"],
-                                           args["expected_revision"], args["statement"],
-                                           args.get("reason")),
-            "memory_id": args["memory_id"],
-            "expected_revision": args["expected_revision"],
-            "statement": args["statement"],
-            "reason": args["reason"],
-        })
-        return self._envelope(response, lambda result: tool_result(
-            proposal_id=result["memory_id"], status="proposed",
-            search_visibility=result.get("search_visibility")))
-
-    def _handle_retract(self, args: dict) -> str:
-        response = self._general_call("retract", {
-            "request_id": self._request_id("retract", args["memory_id"],
-                                           args["expected_revision"], args["reason"]),
-            "memory_id": args["memory_id"],
-            "expected_revision": args["expected_revision"],
-            "reason": args["reason"],
-        })
-        return self._envelope(response, lambda result: tool_result(
-            memory_id=args["memory_id"], status="retracted", revision=result["revision"]))
-
-    def _handle_status(self, args: dict) -> str:
-        return self._envelope(self._general_call("status", {}), lambda result: tool_result(**result))
-
-    def _handle_set_tone(self, args: dict) -> str:
-        sid = self._session_id
-        current = self._tone.get(sid)
-        weight = float(args.get("weight", 0.7))
-        if args.get("preset"):
-            new_state = apply_preset(current, args["preset"], weight)
-        elif args.get("axes"):
-            new_state = apply_axes(current, args["axes"], weight)
-        else:
-            return tool_error("aeon_set_tone requires preset or axes")
-        self._tone.set(sid, new_state)
-        return tool_result(tone=new_state.to_dict())
-
-    def _handle_get_tone(self, args: dict) -> str:
-        return tool_result(tone=self._tone.get(self._session_id).to_dict())
-
-    # -- Ingest tool dispatchers --------------------------------------------
-    # Each is a thin wrapper around the corresponding ingest.<module>.run().
-    # Same code path for cron triggers and chat invocations.
-
-    def _handle_pull_bookmarks(self, args: dict) -> str:
-        from .ingest import bookmarks
-        result = bookmarks.run(self._db, backfill=bool(args.get("backfill", False)))
-        return tool_result(**result)
-
-    def _handle_pull_github(self, args: dict) -> str:
-        from .ingest import github
-        return tool_result(**github.run(self._db))
-
-    def _handle_pull_oura(self, args: dict) -> str:
-        return tool_error('Health access is not part of the general service')
-
-    def _handle_pull_rss(self, args: dict) -> str:
-        from .ingest import rss
-        return tool_result(**rss.run(self._db))
-
-    def _handle_pull_x(self, args: dict) -> str:
-        from .ingest import twitter
-        return tool_result(**twitter.run(self._db))
-
-    def _handle_pull_hf_papers(self, args: dict) -> str:
-        from .ingest import hf_papers
-        return tool_result(**hf_papers.run(self._db))
-
-    def _handle_pull_hype(self, args: dict) -> str:
-        from .ingest import hype
-        return tool_result(**hype.run(self._db))
-
-    def _handle_derive_profile(self, args: dict) -> str:
-        return tool_error('Legacy profile derivation is unavailable without general input lineage')
-
-    def _handle_digest(self, args: dict) -> str:
-        from .ingest import digest
-        hours = int(args.get("hours", 24))
-        return tool_result(**digest.run(self._db, hours=hours))
-
-    # -- Auto-extract -------------------------------------------------------
-
-    _URL_RE = re.compile(r'https?://[^\s<>"\']+')
-    _DECISION_RE = re.compile(r'\b(?:we|i)\s+(?:decided|chose|went with|picked|will use)\s+(.+)', re.IGNORECASE)
-    _TASK_RE = re.compile(r'\b(?:i need to|need to|todo:|todo |i should|i must)\s+(.+)', re.IGNORECASE)
-    _AUTO_EXTRACT_URL_CAP = 10  # bound session-end network work
-
-    def _auto_extract_from_transcript(self, messages: list) -> None:
-        captured = 0
-        urls_seen: set[str] = set()
-
-        for msg in messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str) or len(content) < 10:
-                continue
-
-            for url in self._URL_RE.findall(content):
-                if url in urls_seen:
-                    continue
-                urls_seen.add(url)
-                if len(urls_seen) > self._AUTO_EXTRACT_URL_CAP:
-                    break
-                try:
-                    self._handle_capture({"domain": "inbox", "type": "link", "url": url,
-                                          "source": "session-extract"})
-                    captured += 1
-                except Exception:
-                    pass
-
-            m = self._DECISION_RE.search(content)
-            if m:
-                try:
-                    self._handle_capture({"domain": "work", "type": "note",
-                                          "content": content[:600],
-                                          "title": m.group(1)[:120].strip(),
-                                          "source": "session-extract"})
-                    captured += 1
-                except Exception:
-                    pass
-
-            m = self._TASK_RE.search(content)
-            if m:
-                try:
-                    self._handle_capture({"domain": "inbox", "type": "task",
-                                          "content": content[:600],
-                                          "title": m.group(1)[:120].strip(),
-                                          "source": "session-extract"})
-                    captured += 1
-                except Exception:
-                    pass
-
-        if captured:
-            logger.info("aeon auto-extract: captured %d items", captured)
+    def _save(self, sessions: List[Saved], *, send: bool = True) -> None:
+        """Spool each (session id, transcript, when it ended), then send unless ``send`` is false."""
+        if not self._writes:
+            return
+        spool_dir = self._home / "aeon-emerald" / "spool"
+        spool = Spool(spool_dir)
+        # Spool first: an outage, a crash or an interrupted send then loses nothing.
+        captured = []
+        for session_id, messages, ended_at in sessions:
+            captures = session_captures(session_id, messages or [], ended_at=ended_at,
+                                        platform=self._platform or None)
+            for arguments in captures:
+                spool.put(arguments)
+            captured += [session_id] if captures else []
+        if not send or not spool.pending():
+            return
+        try:
+            client = Emerald.from_settings(self._home, KEY_SETTING)
+        except SettingMissing as error:
+            logger.error("aeon-emerald: %s not sent, captures wait in %s: %s", captured, spool_dir, error)
+            return
+        try:
+            waiting = drain(client, spool, Ledger(self._home / "aeon-emerald" / "acknowledged-sessions"))
+        finally:
+            client.close()
+        if captured and not waiting:
+            logger.info("aeon-emerald: captured session(s) %s", ", ".join(captured))
